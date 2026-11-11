@@ -14,26 +14,41 @@ It uses:
   river, or stream); Massachusetts hydrography alone does not establish public
   fishing access.
 - USGS Water Data for a recent nearby water-temperature reading when available.
-- The National Weather Service hourly forecast to determine local time and
-  wind influence on lure ranking. Forecast details are not shown in the report.
-- Official Massachusetts and New Hampshire public-access datasets, plus
-  OpenStreetMap features tagged for fishing and parking, within about five
-  miles. Results link to Google Maps and show their mapped access status.
+- The nearest available National Weather Service station's latest wind
+  observation, including its age and direction. The hourly forecast still
+  informs lure ranking; the report displays the current station observation.
+- A satellite map from Esri, a state waterbody outline when available, and
+  official Massachusetts or New Hampshire bathymetric contours when available.
+  New Hampshire contour metadata specifies feet; the Massachusetts service
+  does not specify the depth unit in its layer metadata.
 - Seasonal and water-temperature lure profiles with waterbody-specific
   day/night picks and short shore-casting instructions.
 
 Lure picks are rule-based seasonal, temperature, species, and habitat guidance,
 not a live scrape of fishing reports or local catch data and not a guarantee.
-Map and state inventory listings may be incomplete or out of date; mapped
-access does not guarantee current permission or on-site conditions. Follow
-posted access and parking restrictions. Ambiguous waterbody names are rejected
-rather than silently selecting the wrong location.
+Wind direction is used as a cautious search-side heuristic: wind can move
+surface water and floating forage, but does not establish where bass or baitfish
+are holding. River current seams and eddies take priority on moving water.
+Numbered shoreline pins show approximate places to begin casting, not verified
+hotspots, safe paths, or public access. Waterbody boundaries and contour
+coverage are incomplete; check ownership, posted rules, weather, and conditions
+before fishing. Ambiguous waterbody names are rejected rather than silently
+selecting the wrong location.
 
-The recommendation endpoint uses free public services and does not require the
+The wind heuristic is intentionally limited. Field research has documented
+wind-related patchiness in planktonic predator-prey overlap
+([Limnology and Oceanography, 2010](https://doi.org/10.4319/lo.2010.55.4.1590)),
+and littoral fish distributions associated with fetch and physical habitat
+([Limnology and Oceanography, 2005](https://doi.org/10.4319/lo.2005.50.2.0465)).
+Neither study predicts bass locations for a specific shoreline, so the app does
+not label its wind-based casting zones as proven hotspots.
+
+The recommendation endpoint uses public data services and does not require the
 OpenAI key or a signed-in catch account. It does require the server to have
 internet access to MassGIS and NH GRANIT/Fish and Game (where applicable),
-OpenStreetMap, Overpass, National Weather Service, and USGS. Access data
-attribution and the OpenStreetMap copyright link appear in the report.
+National Weather Service, USGS, and OpenStreetMap for fallback waterbody
+lookups. The map also loads Esri satellite tiles; its optional street layer
+loads OpenStreetMap tiles and displays required map attribution.
 
 This is the phone-friendly, installable web app with a Supabase-backed catch
 log. The Tkinter desktop app is a separate client for now and has not been
@@ -97,8 +112,11 @@ then to the configured AI provider. The AI returns up to three suggestions from
 the app's species list; visual identification and the displayed confidence are
 estimates, and the user chooses the species before saving.
 
-The initial version accepts JPEG, PNG, and WebP photos up to 8 MB. Stored photos
-are private to the signed-in user and are saved in Supabase Storage.
+The initial version accepts JPEG, PNG, and WebP photos up to 8 MB. On mobile,
+the photo picker allows choosing an existing library image or taking a new
+photo. Set the catch date and time separately, so a historical photo can be
+logged later. Stored photos are private to the signed-in user and are saved in
+Supabase Storage.
 
 ## Data sync
 

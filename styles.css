@@ -330,14 +330,14 @@ input[type="file"]::file-selector-button {
 .recommendation-submit { display: flex; align-items: center; justify-content: space-between; gap: 15px; margin-top: 16px; }
 .recommendation-submit p { margin: 0; }
 .recommendation-results { display: grid; gap: 14px; margin-top: 20px; }
-.recommendation-overview, .report-access { padding: 19px; }
+.recommendation-overview, .wind-panel, .recommendation-map-card { padding: 19px; }
 .recommendation-overview h2 { margin: 0 0 7px; font-size: 1.35rem; }
 .recommendation-overview > p { margin: 0 0 15px; }
 .report-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .report-fact { display: grid; gap: 5px; min-width: 0; padding: 12px; border: 1px solid var(--border); border-radius: 11px; background: rgb(8 24 39 / 38%); }
 .report-fact strong { color: var(--teal-soft); font-size: .76rem; }
 .report-fact span { font-size: .85rem; line-height: 1.4; overflow-wrap: anywhere; }
-.lure-panel h3, .report-access h3 { margin: 0 0 13px; font-size: .98rem; }
+.lure-panel h3, .wind-panel h3, .recommendation-map-card h3 { margin: 0 0 10px; font-size: .98rem; }
 .lure-recommendation-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .lure-panel { padding: 19px; }
 .lure-picks { display: grid; gap: 10px; margin: 0; padding-left: 22px; }
@@ -345,14 +345,18 @@ input[type="file"]::file-selector-button {
 .lure-picks li::marker { color: var(--gold); font-weight: 800; }
 .lure-picks strong { color: var(--teal-soft); font-size: .92rem; }
 .lure-picks p { margin: 5px 0 0; font-size: .78rem; line-height: 1.5; }
-.report-access > p { margin: -5px 0 15px; }
-.report-access h4 { margin: 17px 0 7px; color: var(--teal-soft); font-size: .83rem; }
-.access-list { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
-.access-list li { display: flex; justify-content: space-between; gap: 12px; align-items: start; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: rgb(8 24 39 / 38%); font-size: .78rem; }
-.access-details { line-height: 1.45; }
-.access-list a, .report-access > a { color: var(--teal-soft); font-weight: 700; }
-.access-list a { flex: 0 0 auto; }
-.report-access > a { display: inline-block; margin-top: 15px; font-size: .8rem; }
+.wind-panel p { margin: 0 0 8px; line-height: 1.5; }
+.wind-panel > a, .recommendation-map-card a { color: var(--teal-soft); font-weight: 700; }
+.wind-guidance { margin-top: 10px !important; }
+.recommendation-map-card > p { margin: 0 0 10px; line-height: 1.5; }
+.recommendation-map { height: clamp(320px, 54vh, 570px); min-height: 320px; overflow: hidden; border: 1px solid var(--border); border-radius: 12px; background: #d7e2db; isolation: isolate; }
+.recommendation-map .leaflet-control-layers { border: 1px solid #b5c8c9; border-radius: 8px; }
+.recommendation-map .leaflet-control-attribution { font-size: .62rem; }
+.shore-zone-icon { border: 0; background: transparent; }
+.shore-zone-icon span { display: grid; width: 32px; height: 32px; place-items: center; border: 2px solid #fff; border-radius: 50%; background: #d98630; box-shadow: 0 2px 8px rgb(0 0 0 / 55%); color: #fff; font-size: .9rem; font-weight: 900; }
+.recommendation-map .leaflet-popup-content-wrapper, .recommendation-map .leaflet-popup-tip { background: #0b1f33; color: #edf5f2; }
+.recommendation-map .leaflet-popup-content { max-width: 230px; line-height: 1.45; }
+.recommendation-map .leaflet-popup-content p { margin: 6px 0; }
 .map-attribution { display: block; margin-top: 12px; color: var(--muted); font-size: .68rem; }
 .map-attribution a { color: inherit; }
 footer { display: flex; justify-content: space-between; gap: 10px; max-width: 1180px; margin: auto; padding: 18px 28px 28px; color: #7897a4; font-size: .75rem; }
@@ -394,8 +398,8 @@ footer { display: flex; justify-content: space-between; gap: 10px; max-width: 11
   .recommendation-submit { align-items: flex-start; flex-direction: column; }
   .recommendation-submit .button { width: 100%; }
   .lure-recommendation-grid { grid-template-columns: 1fr; }
-  .recommendation-overview, .report-access, .lure-panel { padding: 15px; }
-  .access-list li { flex-direction: column; }
+  .recommendation-overview, .wind-panel, .recommendation-map-card, .lure-panel { padding: 15px; }
+  .recommendation-map { height: 360px; min-height: 320px; }
   footer { padding: 15px; font-size: .69rem; }
 }
 

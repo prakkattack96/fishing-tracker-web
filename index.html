@@ -8,8 +8,10 @@
     <title>Fishing Tracker</title>
     <link rel="manifest" href="/manifest.webmanifest">
     <link rel="icon" href="/fish-icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
     <link rel="stylesheet" href="/styles.css">
     <script src="/config.js"></script>
+    <script defer src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
     <script defer src="/app.js"></script>
   </head>
   <body>
@@ -69,9 +71,9 @@
         </div>
         <form id="catch-form" class="panel catch-form">
           <div class="form-grid">
-            <label>Date<input id="catch-date" type="date" required></label>
+            <label>Date caught<input id="catch-date" type="date" required></label>
             <div class="time-controls">
-              <label>Time<select id="catch-time" required></select></label>
+              <label>Time caught<select id="catch-time" required></select></label>
               <label>AM / PM<select id="catch-ampm"><option>AM</option><option>PM</option></select></label>
             </div>
             <label>Species<input id="catch-species" list="species-options" placeholder="Start typing a species" required autocomplete="off"></label>
@@ -79,7 +81,7 @@
             <label>Lure / bait<input id="catch-bait" list="bait-options" placeholder="What did they bite?" required autocomplete="off"></label>
             <datalist id="bait-options"></datalist>
             <label class="wide">Notes <span class="muted">(optional)</span><textarea id="catch-notes" rows="2" maxlength="1000" placeholder="Weather, water, or anything worth remembering…"></textarea></label>
-            <label class="wide photo-label">Photo <span class="muted">(optional · JPEG, PNG or WebP, max 8 MB)</span><input id="catch-photo" type="file" accept="image/jpeg,image/png,image/webp" capture="environment"></label>
+            <label class="wide photo-label">Photo <span class="muted">(optional · choose from camera or photo library; JPEG, PNG or WebP, max 8 MB)</span><input id="catch-photo" type="file" accept="image/jpeg,image/png,image/webp"></label>
           </div>
           <div id="photo-preview-wrap" class="photo-preview-wrap" hidden>
             <img id="photo-preview" alt="Selected catch photo preview">
@@ -129,7 +131,7 @@
         <div class="section-heading">
           <div>          <p class="eyebrow">SEASON + WATER TEMPERATURE · SHORE-CASTING</p><h2>Shore lure guide</h2></div>
         </div>
-        <p class="muted recommendation-intro">Get concise day and night lure picks, casting tips, and nearby mapped fishing access.</p>
+        <p class="muted recommendation-intro">Get concise day and night lure picks, current local wind, and a satellite waterbody map with depth contours where available.</p>
         <form id="recommendation-form" class="panel recommendation-form">
           <div class="recommendation-fields">
             <label>Body of water<input id="recommendation-water" name="water_body" type="text" minlength="2" maxlength="100" placeholder="e.g., Long Pond, Plymouth" required></label>

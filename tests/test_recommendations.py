@@ -52,7 +52,7 @@ class RecommendationTests(unittest.TestCase):
             patch.object(
                 server,
                 "_nearby_fishing_access",
-                return_value={"fishing_spots": [], "parking": []},
+                side_effect=AssertionError("The recommendation report should not query access lists."),
             ),
         ):
             report = server.build_recommendation_report(
@@ -82,6 +82,9 @@ class RecommendationTests(unittest.TestCase):
         self.assertNotIn("weather", report)
         self.assertNotIn("sources", report)
         self.assertNotIn("behavior_context", report)
+        self.assertNotIn("access", report)
+        self.assertIn("waterbody_map", report)
+        self.assertFalse(report["wind"]["current"]["available"])
         self.assertTrue(all("how" in pick for pick in report["recommendations"]["day"]))
 
     def test_location_search_accepts_waterbody_in_selected_state(self):
@@ -380,6 +383,124 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(wind["daytime"]["maximum_wind_mph"], 15)
         self.assertEqual(wind["nighttime"]["maximum_wind_mph"], 5)
 
+    def test_current_station_wind_uses_nearest_fresh_observation(self):
+        zone = ZoneInfo("America/New_York")
+        local_now = datetime.now(zone)
+        stations = {
+            "features": [
+                {
+                    "properties": {"stationIdentifier": "KAAA", "name": "Far station"},
+                    "geometry": {"coordinates": [-74.8, 40.1]},
+                },
+                {
+                    "properties": {"stationIdentifier": "KBED", "name": "Nearby station"},
+                    "geometry": {"coordinates": [-74.66, 40.35]},
+                },
+            ]
+        }
+        observation = {
+            "properties": {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "windSpeed": {"unitCode": "wmoUnit:km_h-1", "value": 16.668},
+                "windDirection": {"value": 315},
+            }
+        }
+        with patch.object(
+            server, "_external_json", side_effect=[stations, observation]
+        ):
+            wind = server._current_station_wind(
+                "https://api.weather.gov/gridpoints/PHI/1,1/stations",
+                {"latitude": 40.35, "longitude": -74.66},
+                local_now,
+            )
+
+        self.assertTrue(wind["available"])
+        self.assertEqual(wind["station_id"], "KBED")
+        self.assertEqual(wind["wind_speed_mph"], 10.4)
+        self.assertEqual(wind["wind_direction"], "NW")
+
+    def test_stale_station_wind_is_not_presented_as_current(self):
+        zone = ZoneInfo("America/New_York")
+        local_now = datetime.now(zone)
+        stations = {
+            "features": [
+                {
+                    "properties": {"stationIdentifier": "KBED", "name": "Nearby station"},
+                    "geometry": {"coordinates": [-74.66, 40.35]},
+                }
+            ]
+        }
+        observation = {
+            "properties": {
+                "timestamp": (
+                    datetime.now(timezone.utc) - timedelta(hours=4)
+                ).isoformat(),
+                "windSpeed": {"unitCode": "wmoUnit:km_h-1", "value": 16},
+                "windDirection": {"value": 315},
+            }
+        }
+        with patch.object(
+            server, "_external_json", side_effect=[stations, observation]
+        ):
+            wind = server._current_station_wind(
+                "https://api.weather.gov/gridpoints/PHI/1,1/stations",
+                {"latitude": 40.35, "longitude": -74.66},
+                local_now,
+            )
+
+        self.assertFalse(wind["available"])
+        self.assertIn("stale", wind["message"])
+
+    def test_waterbody_outline_places_downwind_shoreline_pins(self):
+        ring = [
+            [-71.01, 42.01],
+            [-70.99, 42.01],
+            [-70.99, 41.99],
+            [-71.01, 41.99],
+            [-71.01, 42.01],
+        ]
+        geometry, shoreline = server._arcgis_map_geometry({"rings": [ring]})
+        spots = server._shoreline_spots(
+            shoreline,
+            {
+                "current": {
+                    "available": True,
+                    "wind_speed_mph": 12,
+                    "wind_direction_degrees": 315,
+                    "wind_direction": "NW",
+                }
+            },
+        )
+
+        self.assertEqual(geometry["type"], "Polygon")
+        self.assertEqual(len(spots), 3)
+        self.assertGreater(spots[0]["longitude"], -71.0)
+        self.assertLess(spots[0]["latitude"], 42.0)
+        self.assertIn("NW", spots[0]["reason"])
+
+    def test_bathymetry_contours_are_returned_with_source_units(self):
+        response = {
+            "features": [
+                {
+                    "attributes": {"lake": "WINNIPESAUKEE", "depth": 40},
+                    "geometry": {"paths": [[[-71.41, 43.60], [-71.40, 43.61]]]},
+                }
+            ]
+        }
+        with patch.object(server, "_external_json", return_value=response):
+            contours = server._bathymetry_contours(
+                {
+                    "place": "Lake Winnipesaukee",
+                    "latitude": 43.6,
+                    "longitude": -71.4,
+                },
+                "NH",
+            )
+
+        self.assertTrue(contours["available"])
+        self.assertEqual(contours["unit"], "ft")
+        self.assertEqual(contours["contours"][0]["depth"], 40)
+
     def test_windy_day_prioritizes_a_moving_shore_lure_without_showing_forecast(self):
         calm = server._recommend_lures("Largemouth Bass", 55, "winter", {})
         windy = server._recommend_lures(
@@ -525,6 +646,19 @@ class RecommendationTests(unittest.TestCase):
 
         self.assertFalse(report["available"])
         self.assertIn("No recent USGS", report["message"])
+
+
+class MobilePhotoPickerTests(unittest.TestCase):
+    def test_mobile_photo_picker_allows_library_images_and_historical_dates(self):
+        html = (server.APP_DIRECTORY / "index.html").read_text(encoding="utf-8")
+        photo_input = next(
+            line for line in html.splitlines() if 'id="catch-photo"' in line
+        )
+
+        self.assertIn('accept="image/jpeg,image/png,image/webp"', photo_input)
+        self.assertNotIn("capture=", photo_input)
+        self.assertIn('id="catch-date" type="date" required', html)
+        self.assertIn('id="catch-time" required', html)
 
 
 if __name__ == "__main__":

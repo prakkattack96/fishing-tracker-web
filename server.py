@@ -68,6 +68,14 @@ NH_FISHING_ACCESS_URL = (
     "https://services8.arcgis.com/hg1B9Egwk1I5p300/arcgis/rest/services/"
     "nh_access_sites/FeatureServer/0/query"
 )
+MA_BATHYMETRY_URL = (
+    "https://arcgisserver.digital.mass.gov/arcgisserver/rest/services/AGOL/"
+    "MassWildlife_Inland_Bathymetry/FeatureServer/0/query"
+)
+NH_BATHYMETRY_URL = (
+    "https://nhgeodata.unh.edu/hosting/rest/services/Hosted/"
+    "EDP_Bathymetry_Lakes/FeatureServer/0/query"
+)
 _geocoder_lock = threading.Lock()
 _last_geocoder_request = 0.0
 
@@ -731,6 +739,7 @@ def _local_time_and_wind(location: dict) -> tuple[str, datetime, dict]:
         timezone_name = str(properties.get("timeZone", ""))
         zone = ZoneInfo(timezone_name)
         local_now = datetime.now(zone)
+        observation_stations_url = properties.get("observationStations")
         forecast_url = properties.get("forecastHourly")
         if not isinstance(forecast_url, str) or not forecast_url.startswith(
             "https://api.weather.gov/"
@@ -773,7 +782,133 @@ def _local_time_and_wind(location: dict) -> tuple[str, datetime, dict]:
         }
         for category, values in wind_speeds.items()
     }
+    wind["current"] = _current_station_wind(
+        observation_stations_url, location, local_now
+    )
     return timezone_name, local_now, wind
+
+
+def _current_station_wind(
+    stations_url: object, location: dict, local_now: datetime
+) -> dict:
+    unavailable = {
+        "available": False,
+        "message": "A current NWS station wind reading is unavailable.",
+        "source": "National Weather Service",
+    }
+    if not isinstance(stations_url, str) or not stations_url.startswith(
+        "https://api.weather.gov/"
+    ):
+        return unavailable
+    try:
+        station_data = _external_json(stations_url, "National Weather Service")
+    except DataSourceError as error:
+        return {**unavailable, "message": f"Current NWS station wind is unavailable ({error})."}
+
+    features = station_data.get("features")
+    if not isinstance(features, list):
+        return {**unavailable, "message": "NWS returned an unexpected station list."}
+    stations = []
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        properties = feature.get("properties")
+        if not isinstance(properties, dict):
+            continue
+        station_id = str(properties.get("stationIdentifier", ""))
+        if not re.fullmatch(r"[A-Z0-9]+", station_id):
+            continue
+        geometry = feature.get("geometry")
+        coordinates = geometry.get("coordinates") if isinstance(geometry, dict) else None
+        if not isinstance(coordinates, (list, tuple)) or len(coordinates) < 2:
+            continue
+        try:
+            distance = _distance_miles(
+                location["latitude"],
+                location["longitude"],
+                float(coordinates[1]),
+                float(coordinates[0]),
+            )
+        except (KeyError, IndexError, TypeError, ValueError):
+            distance = float("inf")
+        if not math.isfinite(distance):
+            continue
+        stations.append((distance, station_id, str(properties.get("name", station_id))))
+    if not stations:
+        return {**unavailable, "message": "NWS did not list a nearby observation station."}
+
+    _, station_id, station_name = min(stations, key=lambda station: station[0])
+    try:
+        observation = _external_json(
+            f"https://api.weather.gov/stations/{station_id}/observations/latest",
+            "National Weather Service",
+        )
+    except DataSourceError as error:
+        return {**unavailable, "message": f"Current NWS station wind is unavailable ({error})."}
+    properties = observation.get("properties")
+    if not isinstance(properties, dict):
+        return {**unavailable, "message": "NWS returned an unexpected station observation."}
+
+    wind_speed = properties.get("windSpeed")
+    wind_direction = properties.get("windDirection")
+    if not isinstance(wind_speed, dict):
+        return {**unavailable, "message": "NWS did not provide a usable wind-speed observation."}
+    if not isinstance(wind_direction, dict):
+        wind_direction = {}
+    try:
+        speed_value = float(wind_speed["value"])
+        speed_unit = str(wind_speed["unitCode"]).rsplit(":", 1)[-1]
+        if speed_unit == "km_h-1":
+            speed_mph = speed_value * 0.621371
+        elif speed_unit == "m_s-1":
+            speed_mph = speed_value * 2.23694
+        elif speed_unit in {"mi_h-1", "mph"}:
+            speed_mph = speed_value
+        else:
+            raise ValueError(f"Unsupported NWS wind-speed unit: {speed_unit}")
+        if not math.isfinite(speed_mph) or speed_mph < 0:
+            raise ValueError("NWS returned an invalid wind speed.")
+        direction_value = wind_direction.get("value")
+        direction_degrees = (
+            float(direction_value) % 360 if direction_value is not None else None
+        )
+        observed_at = datetime.fromisoformat(
+            str(properties["timestamp"]).replace("Z", "+00:00")
+        )
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return {**unavailable, "message": "NWS did not provide a usable wind observation."}
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    age_minutes = (
+        local_now.astimezone(timezone.utc) - observed_at.astimezone(timezone.utc)
+    ).total_seconds() / 60
+    if age_minutes < -15 or age_minutes > 180:
+        return {
+            **unavailable,
+            "message": "The nearest NWS wind observation is stale.",
+            "station": station_name,
+            "station_id": station_id,
+            "observed_at": observed_at.isoformat(),
+            "age_minutes": round(max(age_minutes, 0)),
+        }
+
+    compass = None
+    if direction_degrees is not None:
+        compass = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")[
+            round(direction_degrees / 45) % 8
+        ]
+    return {
+        "available": True,
+        "wind_speed_mph": round(speed_mph, 1),
+        "wind_direction_degrees": direction_degrees,
+        "wind_direction": compass,
+        "station": station_name,
+        "station_id": station_id,
+        "station_url": f"https://api.weather.gov/stations/{station_id}",
+        "observed_at": observed_at.isoformat(),
+        "age_minutes": round(max(age_minutes, 0)),
+        "source": "National Weather Service",
+    }
 
 
 def _parse_usgs_sites(text: str) -> list[dict]:
@@ -851,6 +986,485 @@ def _distance_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float
     delta_lambda = math.radians(lon2 - lon1)
     value = math.sin(delta_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
     return 2 * radius * math.asin(min(1, math.sqrt(value)))
+
+
+def _map_path(path: object, max_points: int = 160) -> list[list[float]]:
+    if not isinstance(path, list):
+        return []
+    points = []
+    for point in path:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            continue
+        try:
+            longitude, latitude = float(point[0]), float(point[1])
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(longitude) or not math.isfinite(latitude):
+            continue
+        if not -180 <= longitude <= 180 or not -90 <= latitude <= 90:
+            continue
+        points.append([longitude, latitude])
+    if len(points) > max_points:
+        stride = math.ceil((len(points) - 1) / (max_points - 1))
+        sampled = points[::stride]
+        if sampled[-1] != points[-1]:
+            sampled.append(points[-1])
+        points = sampled
+    return points
+
+
+def _arcgis_map_geometry(geometry: object) -> tuple[dict | None, list[list[float]]]:
+    if not isinstance(geometry, dict):
+        return None, []
+    rings = geometry.get("rings")
+    if isinstance(rings, list):
+        normalized_rings = [
+            ring
+            for ring in (_map_path(item, 180) for item in rings)
+            if len(ring) >= 4
+        ]
+        if not normalized_rings:
+            return None, []
+        largest_ring = max(normalized_rings, key=lambda ring: abs(_ring_area(ring)))
+        return {"type": "Polygon", "coordinates": normalized_rings}, largest_ring
+    paths = geometry.get("paths")
+    if isinstance(paths, list):
+        normalized_paths = [
+            path
+            for path in (_map_path(item, 180) for item in paths)
+            if len(path) >= 2
+        ]
+        if not normalized_paths:
+            return None, []
+        return {"type": "MultiLineString", "coordinates": normalized_paths}, []
+    return None, []
+
+
+def _ring_area(ring: list[list[float]]) -> float:
+    return sum(
+        ring[index][0] * ring[index + 1][1]
+        - ring[index + 1][0] * ring[index][1]
+        for index in range(len(ring) - 1)
+    ) / 2
+
+
+def _ring_centroid(ring: list[list[float]]) -> tuple[float, float]:
+    area = _ring_area(ring)
+    if abs(area) < 1e-12:
+        return (
+            sum(point[1] for point in ring) / len(ring),
+            sum(point[0] for point in ring) / len(ring),
+        )
+    longitude_sum = latitude_sum = 0.0
+    for index in range(len(ring) - 1):
+        longitude, latitude = ring[index]
+        next_longitude, next_latitude = ring[index + 1]
+        cross = longitude * next_latitude - next_longitude * latitude
+        longitude_sum += (longitude + next_longitude) * cross
+        latitude_sum += (latitude + next_latitude) * cross
+    return latitude_sum / (6 * area), longitude_sum / (6 * area)
+
+
+def _map_waterbody_tokens(water_body: str) -> set[str]:
+    name_tokens, _ = _waterbody_query_parts(water_body)
+    return name_tokens - {
+        "lake", "river", "stream", "creek", "brook", "pond", "reservoir",
+        "water", "the",
+    }
+
+
+def _waterbody_geometry(
+    location: dict, state: str, water_body: str | None = None
+) -> dict:
+    if state == "MA":
+        endpoint, name_field, source = MA_WATER_FEATURES_URL, "NAME", "MassGIS"
+    elif state == "NH":
+        endpoint, name_field, source = NH_WATER_FEATURES_URL, "gnis_name", "NH GRANIT"
+    else:
+        return {
+            "geometry": None,
+            "shoreline_ring": [],
+            "source": None,
+            "message": "A waterbody outline is not available from the state map layers.",
+        }
+
+    name = water_body or str(location.get("place", ""))
+    tokens = _map_waterbody_tokens(name) or _waterbody_tokens(
+        str(location.get("place", ""))
+    )
+    if not tokens:
+        return {
+            "geometry": None,
+            "shoreline_ring": [],
+            "source": source,
+            "message": "A waterbody outline could not be matched by name.",
+        }
+    search_token = sorted(tokens, key=lambda token: (-len(token), token))[0]
+    query = endpoint + "?" + urlencode(
+        {
+            "where": f"UPPER({name_field}) LIKE '%{search_token.upper()}%'",
+            "outFields": name_field,
+            "returnGeometry": "true",
+            "returnCentroid": "true",
+            "outSR": "4326",
+            "geometryPrecision": 5,
+            "resultRecordCount": 100,
+            "f": "json",
+        }
+    )
+    try:
+        result = _external_json(query, source)
+    except DataSourceError as error:
+        return {
+            "geometry": None,
+            "shoreline_ring": [],
+            "source": source,
+            "message": f"The {source} waterbody outline is unavailable ({error}).",
+        }
+    features = result.get("features")
+    if not isinstance(features, list):
+        return {
+            "geometry": None,
+            "shoreline_ring": [],
+            "source": source,
+            "message": f"{source} returned an unexpected waterbody outline.",
+        }
+
+    candidates = []
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        attributes = feature.get("attributes")
+        if not isinstance(attributes, dict):
+            continue
+        feature_tokens = _waterbody_tokens(str(attributes.get(name_field, "")))
+        if not tokens.issubset(feature_tokens):
+            continue
+        map_geometry, shoreline_ring = _arcgis_map_geometry(feature.get("geometry"))
+        if map_geometry is None:
+            continue
+        centroid = feature.get("centroid")
+        if not isinstance(centroid, dict):
+            centroid = {}
+        try:
+            latitude = float(centroid["y"])
+            longitude = float(centroid["x"])
+        except (KeyError, TypeError, ValueError):
+            map_coordinates = (
+                shoreline_ring
+                or map_geometry.get("coordinates", [[]])[0]
+            )
+            if not map_coordinates:
+                continue
+            latitude, longitude = _ring_centroid(map_coordinates)
+        distance = _distance_miles(
+            location["latitude"], location["longitude"], latitude, longitude
+        )
+        candidates.append((distance, map_geometry, shoreline_ring))
+    if not candidates:
+        return {
+            "geometry": None,
+            "shoreline_ring": [],
+            "source": source,
+            "message": f"No {source} outline is published for this waterbody.",
+        }
+    _, geometry, shoreline_ring = min(candidates, key=lambda candidate: candidate[0])
+    return {
+        "geometry": geometry,
+        "shoreline_ring": shoreline_ring,
+        "source": source,
+        "message": None,
+    }
+
+
+def _bathymetry_contours(
+    location: dict, state: str, water_body: str | None = None
+) -> dict:
+    if state == "MA":
+        endpoint, name_field, depth_field = MA_BATHYMETRY_URL, "NAME", "DEPTH"
+        source = "MassWildlife Inland Bathymetry"
+        source_url = (
+            "https://arcgisserver.digital.mass.gov/arcgisserver/rest/services/"
+            "AGOL/MassWildlife_Inland_Bathymetry/FeatureServer"
+        )
+        unit = None
+    elif state == "NH":
+        endpoint, name_field, depth_field = NH_BATHYMETRY_URL, "lake", "depth"
+        source = "NH DES / NH Fish and Game bathymetry"
+        source_url = (
+            "https://nhgeodata.unh.edu/hosting/rest/services/Hosted/"
+            "EDP_Bathymetry_Lakes/FeatureServer"
+        )
+        unit = "ft"
+    else:
+        return {
+            "available": False,
+            "message": "No state bathymetry layer is connected for this location.",
+            "contours": [],
+        }
+
+    name = water_body or str(location.get("place", ""))
+    tokens = _map_waterbody_tokens(name) or _waterbody_tokens(
+        str(location.get("place", ""))
+    )
+    if not tokens:
+        return {
+            "available": False,
+            "message": "No named bathymetry contours could be matched to this waterbody.",
+            "contours": [],
+        }
+    search_token = sorted(tokens, key=lambda token: (-len(token), token))[0]
+    query = endpoint + "?" + urlencode(
+        {
+            "where": f"UPPER({name_field}) LIKE '%{search_token.upper()}%'",
+            "outFields": f"{name_field},{depth_field},DLABEL"
+            if state == "MA"
+            else f"{name_field},{depth_field}",
+            "returnGeometry": "true",
+            "outSR": "4326",
+            "geometryPrecision": 5,
+            "resultRecordCount": 500,
+            "f": "json",
+        }
+    )
+    try:
+        result = _external_json(query, source)
+    except DataSourceError as error:
+        return {
+            "available": False,
+            "message": f"The {source} layer is unavailable ({error}).",
+            "contours": [],
+            "source": source,
+            "source_url": source_url,
+        }
+    features = result.get("features")
+    if not isinstance(features, list):
+        return {
+            "available": False,
+            "message": f"{source} returned an unexpected contour response.",
+            "contours": [],
+            "source": source,
+            "source_url": source_url,
+        }
+
+    contours = []
+    total_points = 0
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        attributes = feature.get("attributes")
+        geometry = feature.get("geometry")
+        if not isinstance(attributes, dict) or not isinstance(geometry, dict):
+            continue
+        feature_tokens = _waterbody_tokens(str(attributes.get(name_field, "")))
+        if not tokens.issubset(feature_tokens):
+            continue
+        try:
+            depth = float(attributes[depth_field])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not math.isfinite(depth) or depth <= 0:
+            continue
+        paths = geometry.get("paths")
+        if not isinstance(paths, list):
+            continue
+        for path in paths:
+            coordinates = _map_path(path, 100)
+            if len(coordinates) < 2:
+                continue
+            nearest_distance = min(
+                _distance_miles(
+                    location["latitude"],
+                    location["longitude"],
+                    latitude,
+                    longitude,
+                )
+                for longitude, latitude in coordinates
+            )
+            if nearest_distance > 8:
+                continue
+            if total_points + len(coordinates) > 1800:
+                break
+            contours.append(
+                {
+                    "depth": depth,
+                    "coordinates": coordinates,
+                }
+            )
+            total_points += len(coordinates)
+        if total_points >= 1800:
+            break
+    return {
+        "available": bool(contours),
+        "message": None
+        if contours
+        else f"No published depth contours were found for {location.get('place', 'this waterbody')}.",
+        "unit": unit,
+        "contours": contours,
+        "source": source,
+        "source_url": source_url,
+    }
+
+
+def _bearing_degrees(
+    latitude: float, longitude: float, target_latitude: float, target_longitude: float
+) -> float:
+    phi1, phi2 = math.radians(latitude), math.radians(target_latitude)
+    delta_longitude = math.radians(target_longitude - longitude)
+    y = math.sin(delta_longitude) * math.cos(phi2)
+    x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(delta_longitude)
+    return (math.degrees(math.atan2(y, x)) + 360) % 360
+
+
+def _compass_direction(degrees: float) -> str:
+    return ("N", "NE", "E", "SE", "S", "SW", "W", "NW")[
+        round(degrees / 45) % 8
+    ]
+
+
+def _shoreline_spots(shoreline_ring: list[list[float]], wind: dict) -> list[dict]:
+    if len(shoreline_ring) < 4:
+        return []
+    latitude, longitude = _ring_centroid(shoreline_ring)
+    current = wind.get("current", {})
+    wind_available = bool(current.get("available"))
+    direction = current.get("wind_direction_degrees") if wind_available else None
+    speed = current.get("wind_speed_mph") if wind_available else None
+    if direction is not None and speed is not None and speed >= 3:
+        downwind = (float(direction) + 180) % 360
+        targets = [
+            (downwind, "Downwind shoreline · first check"),
+            ((downwind - 45) % 360, "Adjacent downwind shoreline"),
+            ((downwind + 45) % 360, "Adjacent downwind shoreline"),
+        ]
+    else:
+        targets = [
+            (0, "North shoreline check"),
+            (120, "Southeast shoreline check"),
+            (240, "Southwest shoreline check"),
+        ]
+
+    candidates = sorted(
+        (
+            _bearing_degrees(latitude, longitude, point[1], point[0]),
+            point,
+        )
+        for point in shoreline_ring
+    )
+    selected = []
+    for target_bearing, label in targets:
+        ordered = sorted(
+            candidates,
+            key=lambda item: min(
+                (item[0] - target_bearing) % 360,
+                (target_bearing - item[0]) % 360,
+            ),
+        )
+        point = next(
+            (
+                candidate
+                for _, candidate in ordered
+                if all(
+                    _distance_miles(
+                        candidate[1],
+                        candidate[0],
+                        existing["latitude"],
+                        existing["longitude"],
+                    )
+                    >= 0.05
+                    for existing in selected
+                )
+            ),
+            None,
+        )
+        if point is None:
+            continue
+        if direction is not None and speed is not None and speed >= 3:
+            reason = (
+                f"Wind from {current.get('wind_direction')} points toward the "
+                f"{_compass_direction((float(direction) + 180) % 360)} side. "
+                "Fan-cast parallel to shore and around nearby points or inlets."
+            )
+        else:
+            reason = (
+                "No usable current wind direction; this is only a shoreline "
+                "checkpoint, not a confirmed hotspot."
+            )
+        selected.append(
+            {
+                "latitude": point[1],
+                "longitude": point[0],
+                "label": label,
+                "reason": reason,
+            }
+        )
+    return selected
+
+
+def _wind_shoreline_guidance(wind: dict, water_type: str) -> dict:
+    current = wind.get("current", {})
+    if not current.get("available"):
+        return {
+            "available": False,
+            "message": current.get(
+                "message", "Current NWS wind data is unavailable for this area."
+            ),
+        }
+    direction = current.get("wind_direction_degrees")
+    speed = current.get("wind_speed_mph")
+    if direction is None or speed is None or speed < 3:
+        return {
+            "available": True,
+            "message": (
+                f"Current wind is {speed} mph with no useful direction. "
+                "There is no clear wind-driven shoreline to prioritize."
+            ),
+        }
+    downwind = (float(direction) + 180) % 360
+    downwind_side = _compass_direction(downwind)
+    if water_type in {"river", "stream"}:
+        message = (
+            f"Wind from {current.get('wind_direction')} at {speed} mph blows "
+            f"toward the {downwind_side} side. On moving water, prioritize "
+            "current seams, eddies, and inflows; use wind only as a secondary "
+            "clue on broad, slow stretches."
+        )
+    else:
+        message = (
+            f"Wind from {current.get('wind_direction')} at {speed} mph blows "
+            f"toward the {downwind_side} side. Start on that downwind shoreline, "
+            "where wind may push floating forage; fan-cast parallel to the bank "
+            "and around points or inlets. This is a search-side heuristic, not "
+            "a confirmed bass location."
+        )
+    if speed >= 18:
+        message += " The wind is strong; avoid exposed or unsafe shorelines."
+    return {
+        "available": True,
+        "downwind_side": downwind_side,
+        "message": message,
+    }
+
+
+def _waterbody_map_data(
+    location: dict, state: str, wind: dict, water_body: str | None = None
+) -> dict:
+    outline = _waterbody_geometry(location, state, water_body)
+    bathymetry = _bathymetry_contours(location, state, water_body)
+    return {
+        "center": {
+            "latitude": location["latitude"],
+            "longitude": location["longitude"],
+        },
+        "geometry": outline["geometry"],
+        "boundary_source": outline["source"],
+        "boundary_message": outline["message"],
+        "shoreline_spots": _shoreline_spots(outline["shoreline_ring"], wind),
+        "wind_guidance": _wind_shoreline_guidance(
+            wind, location.get("water_type", "waterbody")
+        ),
+        "bathymetry": bathymetry,
+    }
 
 
 def _arcgis_nearby_features(
@@ -1601,7 +2215,7 @@ def build_recommendation_report(payload: RecommendationRequest) -> dict:
     recommendations = _recommend_lures(
         target_species, temp, season, weather, water_type
     )
-    access = _nearby_fishing_access(location, state)
+    waterbody_map = _waterbody_map_data(location, state, weather, water_body)
     return {
         "water_body": water_body,
         "state": {"code": state, "name": STATES[state]},
@@ -1612,7 +2226,14 @@ def build_recommendation_report(payload: RecommendationRequest) -> dict:
         "moon": moon,
         "water_temperature": water_temperature,
         "recommendations": recommendations,
-        "access": access,
+        "wind": {
+            "current": weather.get("current", {
+                "available": False,
+                "message": "Current NWS station wind is unavailable.",
+            }),
+            "shoreline_guidance": waterbody_map["wind_guidance"],
+        },
+        "waterbody_map": waterbody_map,
         "timezone": timezone_name,
         "generated_at": local_now.isoformat(),
     }

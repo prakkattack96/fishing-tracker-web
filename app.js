@@ -43,7 +43,8 @@ const state = {
   photo: null,
   photoUrl: null,
   installPrompt: null,
-  syncBusy: false
+  syncBusy: false,
+  recommendationMap: null
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -608,8 +609,168 @@ function reportElement(tag, className = "", text = "") {
   return element;
 }
 
+function googleMapsUrl(point) {
+  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${point.latitude},${point.longitude}`)}`;
+}
+
+function renderRecommendationMap(report) {
+  const mapData = report.waterbody_map || {};
+  const section = reportElement("section", "panel recommendation-map-card");
+  section.append(
+    reportElement("h3", "", "Waterbody map & shore-casting zones"),
+    reportElement(
+      "p",
+      "muted small",
+      "Satellite imagery is not live. Numbered pins are approximate shoreline checks, wind-informed when current direction is available; they are not verified hotspots or public access."
+    )
+  );
+  const map = document.createElement("div");
+  map.className = "recommendation-map";
+  map.setAttribute("role", "application");
+  map.setAttribute("aria-label", "Satellite map of the selected waterbody and suggested shoreline zones");
+  section.append(map);
+
+  const guidance = mapData.wind_guidance?.message;
+  if (guidance) section.append(reportElement("p", "wind-guidance muted", guidance));
+  if (!mapData.geometry) {
+    section.append(reportElement(
+      "p",
+      "muted small",
+      mapData.boundary_message || "No waterbody outline is available; the map will be centered on the selected location."
+    ));
+  }
+  if (mapData.bathymetry?.available) {
+    const unitNote = mapData.bathymetry.unit
+      ? ` in ${mapData.bathymetry.unit}`
+      : " (units are not specified by the source layer)";
+    section.append(reportElement(
+      "p",
+      "muted small",
+      `${mapData.bathymetry.contours.length} published depth contours shown${unitNote}.`
+    ));
+  } else if (mapData.bathymetry?.message) {
+    section.append(reportElement("p", "muted small", mapData.bathymetry.message));
+  }
+  if (!mapData.shoreline_spots?.length) {
+    section.append(reportElement(
+      "p",
+      "muted small",
+      "No shoreline pins could be placed because a mapped shoreline outline is unavailable."
+    ));
+  }
+  const attribution = reportElement("small", "map-attribution");
+  const sources = [];
+  if (mapData.boundary_source) {
+    const href = mapData.boundary_source === "MassGIS"
+      ? "https://services1.arcgis.com/hGdibHYSPO59RG1h/arcgis/rest/services/Massachusetts_Water_Features/FeatureServer"
+      : "https://nhgeodata.unh.edu/hosting/rest/services/Hosted/IWR_WaterResources/FeatureServer";
+    sources.push([mapData.boundary_source, href]);
+  }
+  if (mapData.bathymetry?.source_url) {
+    sources.push([mapData.bathymetry.source, mapData.bathymetry.source_url]);
+  }
+  sources.forEach(([label, href], index) => {
+    if (index) attribution.append(" · ");
+    const link = document.createElement("a");
+    link.href = href;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = label;
+    attribution.append(link);
+  });
+  if (sources.length) section.append(attribution);
+  return { section, map, mapData };
+}
+
+function initializeRecommendationMap(mapElement, mapData) {
+  if (!window.L) {
+    mapElement.replaceWith(reportElement(
+      "p",
+      "muted small",
+      "The map library did not load. Check your internet connection and try again."
+    ));
+    return;
+  }
+  const leaflet = window.L;
+  const map = leaflet.map(mapElement, { scrollWheelZoom: false });
+  state.recommendationMap = map;
+  const satellite = leaflet.tileLayer(
+    "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    {
+      maxZoom: 19,
+      attribution: "Tiles &copy; Esri, Maxar, Earthstar Geographics, and the GIS User Community"
+    }
+  ).addTo(map);
+  const street = leaflet.tileLayer(
+    "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+    {
+      maxZoom: 19,
+      subdomains: "abc",
+      attribution: "&copy; OpenStreetMap contributors"
+    }
+  );
+  const overlays = {};
+  let boundaryLayer = null;
+  if (mapData.geometry) {
+    boundaryLayer = leaflet.geoJSON(mapData.geometry, {
+      style: { color: "#78e2c9", weight: 2, fillColor: "#16847f", fillOpacity: 0.2 }
+    }).addTo(map);
+    overlays["Waterbody outline"] = boundaryLayer;
+  }
+  if (mapData.bathymetry?.available) {
+    const contours = leaflet.layerGroup();
+    for (const contour of mapData.bathymetry.contours) {
+      const line = leaflet.polyline(
+        contour.coordinates.map(([longitude, latitude]) => [latitude, longitude]),
+        { color: "#ffe08a", weight: 1.5, opacity: 0.85 }
+      );
+      const units = mapData.bathymetry.unit ? ` ${mapData.bathymetry.unit}` : "";
+      line.bindTooltip(`Depth contour ${contour.depth}${units}`);
+      contours.addLayer(line);
+    }
+    contours.addTo(map);
+    overlays["Depth contours"] = contours;
+  }
+  const spots = mapData.shoreline_spots || [];
+  spots.forEach((spot, index) => {
+    const icon = leaflet.divIcon({
+      className: "shore-zone-icon",
+      html: `<span>${index + 1}</span>`,
+      iconSize: [32, 32],
+      iconAnchor: [16, 16]
+    });
+    const marker = leaflet.marker([spot.latitude, spot.longitude], { icon }).addTo(map);
+    const popup = document.createElement("div");
+    popup.append(
+      reportElement("strong", "", spot.label),
+      reportElement("p", "", spot.reason)
+    );
+    const link = document.createElement("a");
+    link.href = googleMapsUrl(spot);
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = "Open this point in Google Maps";
+    popup.append(link);
+    marker.bindPopup(popup);
+  });
+  leaflet.control.layers(
+    { "Satellite imagery": satellite, "Street map": street },
+    overlays
+  ).addTo(map);
+
+  const bounds = boundaryLayer?.getBounds();
+  if (bounds?.isValid()) {
+    map.fitBounds(bounds, { padding: [18, 18], maxZoom: 16 });
+  } else if (mapData.center) {
+    map.setView([mapData.center.latitude, mapData.center.longitude], 15);
+  }
+  window.requestAnimationFrame(() => map.invalidateSize());
+}
+
 function renderRecommendationReport(report) {
   const container = $("#recommendation-results");
+  state.recommendationMap?.remove();
+  state.recommendationMap = null;
   container.replaceChildren();
   container.hidden = false;
 
@@ -660,62 +821,45 @@ function renderRecommendationReport(report) {
       list.append(item);
     }
     panel.append(list);
-    lureGrid.append(panel);
-  }
-
-  const access = reportElement("section", "panel report-access");
-  access.append(
-    reportElement("h3", "", "Nearby fishing spots & parking"),
-    reportElement("p", "muted small", "Mapped public or permit-required locations within 5 miles. Follow posted access and parking restrictions.")
-  );
-  const googleMapsUrl = (point) =>
-    `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${point.latitude},${point.longitude}`)}`;
-  for (const [label, points] of [
-    ["Fishing spots", report.access.fishing_spots],
-    ["Parking", report.access.parking]
-  ]) {
-    access.append(reportElement("h4", "", label));
-    if (!points.length) {
-      access.append(reportElement("p", "muted small", `No nearby ${label.toLowerCase()} are mapped.`));
-      continue;
+      lureGrid.append(panel);
     }
-    const list = document.createElement("ul");
-    list.className = "access-list";
-    for (const point of points) {
-      const item = document.createElement("li");
-      const details = reportElement(
-        "span",
-        "access-details",
-        `${point.name} · ${point.distance_miles} mi · ${point.access_status}`
-      );
-      const link = document.createElement("a");
-      link.href = googleMapsUrl(point);
-      link.target = "_blank";
-      link.rel = "noopener noreferrer";
-      link.textContent = "Open in Google Maps";
-      item.append(details, link);
-      list.append(item);
-    }
-    access.append(list);
-  }
-  const broaderSearch = document.createElement("a");
-  broaderSearch.href = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`public fishing access near ${report.water_body}, ${report.state.name}`)}`;
-  broaderSearch.target = "_blank";
-  broaderSearch.rel = "noopener noreferrer";
-  broaderSearch.textContent = "Explore public fishing access in Google Maps";
-  access.append(broaderSearch);
-  const attribution = document.createElement("small");
-  attribution.className = "map-attribution";
-  attribution.append(`Access data: ${report.access.attribution || "OpenStreetMap contributors"}. `);
-  const attributionLink = document.createElement("a");
-  attributionLink.href = "https://www.openstreetmap.org/copyright";
-  attributionLink.target = "_blank";
-  attributionLink.rel = "noopener noreferrer";
-  attributionLink.textContent = "OpenStreetMap copyright terms";
-  attribution.append(attributionLink);
-  access.append(attribution);
 
-  container.append(overview, lureGrid, access);
+    const windPanel = reportElement("section", "panel wind-panel");
+    windPanel.append(reportElement("h3", "", "Current local wind"));
+    const currentWind = report.wind?.current;
+    if (currentWind?.available) {
+      const age = currentWind.age_minutes <= 1
+        ? "just now"
+        : `${currentWind.age_minutes} min ago`;
+      const direction = currentWind.wind_direction
+        ? `from ${currentWind.wind_direction}`
+        : "with variable direction";
+      windPanel.append(reportElement(
+        "p",
+        "",
+        `${currentWind.wind_speed_mph} mph ${direction} · observed ${age} at ${currentWind.station}`
+      ));
+      if (currentWind.station_url) {
+        const stationLink = document.createElement("a");
+        stationLink.href = currentWind.station_url;
+        stationLink.target = "_blank";
+        stationLink.rel = "noopener noreferrer";
+        stationLink.textContent = "NWS station details";
+        windPanel.append(stationLink);
+      }
+    } else {
+      windPanel.append(reportElement(
+        "p",
+        "muted",
+        currentWind?.message || "A current NWS station wind reading is unavailable."
+      ));
+    }
+    const windGuidance = report.wind?.shoreline_guidance?.message;
+    if (windGuidance) windPanel.append(reportElement("p", "wind-guidance", windGuidance));
+
+    const mapCard = renderRecommendationMap(report);
+    container.append(overview, windPanel, lureGrid, mapCard.section);
+    initializeRecommendationMap(mapCard.map, mapCard.mapData);
 }
 
 async function submitRecommendation(event) {
@@ -726,7 +870,7 @@ async function submitRecommendation(event) {
   const message = $("#recommendation-message");
   button.disabled = true;
   button.textContent = "Building your guide…";
-  setMessage(message, "Finding the waterbody, water temperature, and nearby mapped access.");
+  setMessage(message, "Finding the waterbody, current wind, and available shoreline maps.");
   try {
     const report = await fetchJson(`${(CONFIG.apiBaseUrl || "").replace(/\/$/, "")}/api/recommendations`, {
       method: "POST",
