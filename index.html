@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#0b1f33">
+    <meta name="description" content="A pocket fishing journal for catches, lures, and moon phases.">
+    <title>Fishing Tracker</title>
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="icon" href="/fish-icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/config.js"></script>
+    <script defer src="/app.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#" aria-label="Fishing Tracker home">
+        <img src="/fish-icon.svg" alt="" width="42" height="42">
+        <span>FISHING <b>TRACKER</b></span>
+      </a>
+      <div class="top-actions">
+        <span id="connection-status" class="status-pill" role="status">Starting…</span>
+        <button id="install-button" class="button button-outline" hidden>Install app</button>
+        <button id="sign-out-button" class="button button-outline" hidden>Sign out</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">YOUR DAYS ON THE WATER</p>
+          <h1>Make every<br><span>catch count.</span></h1>
+          <p class="hero-description">A pocket fishing journal, ready when the fish are.</p>
+        </div>
+        <div class="hero-art" aria-hidden="true">
+          <span class="bubble bubble-one"></span><span class="bubble bubble-two"></span>
+          <img src="/fish-icon.svg" alt="">
+        </div>
+        <div class="hero-wave"></div>
+      </section>
+
+      <section id="account-panel" class="account-panel panel" aria-labelledby="account-title">
+        <div>
+          <p class="eyebrow">ONE LOG · EVERY DEVICE</p>
+          <h2 id="account-title">Sign in to sync your catches</h2>
+          <p class="muted">Your log is kept on this device until you sign in. Internet is needed to sync, but you can keep logging offline.</p>
+        </div>
+        <form id="auth-form" class="auth-form">
+          <label>Email<input id="auth-email" type="email" autocomplete="email" required></label>
+          <label>Password<input id="auth-password" type="password" minlength="8" autocomplete="current-password" required></label>
+          <div class="button-row">
+            <button class="button button-primary" type="submit" name="auth-action" value="signin">Sign in</button>
+            <button class="button button-secondary" type="submit" name="auth-action" value="signup">Create account</button>
+          </div>
+          <p id="auth-message" class="form-message" aria-live="polite"></p>
+        </form>
+      </section>
+
+      <nav class="tabs" aria-label="Main navigation">
+        <button class="tab active" data-tab="journal" aria-selected="true">Catch journal</button>
+        <button class="tab" data-tab="insights" aria-selected="false">Catch insights</button>
+      </nav>
+
+      <section id="journal-tab" class="tab-panel">
+        <div class="section-heading">
+          <div><p class="eyebrow">ANOTHER ONE FOR THE BOOKS</p><h2>Log a catch</h2></div>
+          <span id="queue-status" class="muted small"></span>
+        </div>
+        <form id="catch-form" class="panel catch-form">
+          <div class="form-grid">
+            <label>Date<input id="catch-date" type="date" required></label>
+            <div class="time-controls">
+              <label>Time<select id="catch-time" required></select></label>
+              <label>AM / PM<select id="catch-ampm"><option>AM</option><option>PM</option></select></label>
+            </div>
+            <label>Species<input id="catch-species" list="species-options" placeholder="Start typing a species" required autocomplete="off"></label>
+            <datalist id="species-options"></datalist>
+            <label>Lure / bait<input id="catch-bait" list="bait-options" placeholder="What did they bite?" required autocomplete="off"></label>
+            <datalist id="bait-options"></datalist>
+            <label class="wide">Notes <span class="muted">(optional)</span><textarea id="catch-notes" rows="2" maxlength="1000" placeholder="Weather, water, or anything worth remembering…"></textarea></label>
+            <label class="wide photo-label">Photo <span class="muted">(optional · JPEG, PNG or WebP, max 8 MB)</span><input id="catch-photo" type="file" accept="image/jpeg,image/png,image/webp" capture="environment"></label>
+          </div>
+          <div id="photo-preview-wrap" class="photo-preview-wrap" hidden>
+            <img id="photo-preview" alt="Selected catch photo preview">
+            <button id="clear-photo" type="button" class="button button-outline">Remove photo</button>
+          </div>
+          <div id="photo-consent" class="consent-row" hidden>
+            <label class="consent"><input id="ai-consent" type="checkbox"> I agree to send this photo to our AI provider for a species suggestion.</label>
+            <button id="identify-button" type="button" class="button button-secondary">Suggest species with AI</button>
+          </div>
+          <div id="suggestions" class="suggestions" aria-live="polite"></div>
+          <div class="form-footer">
+            <p class="muted small">AI suggestions can be wrong. You choose the species before saving.</p>
+            <button class="button button-primary" type="submit">Save catch <span aria-hidden="true">→</span></button>
+          </div>
+          <p id="catch-message" class="form-message" aria-live="polite"></p>
+        </form>
+
+        <div class="section-heading journal-heading">
+          <div><p class="eyebrow">THE ONES THAT DIDN'T GET AWAY</p><h2>Your catches <span id="catch-count" class="count-badge">0</span></h2></div>
+        </div>
+        <div id="catch-list" class="catch-list"></div>
+        <p id="empty-state" class="empty-state panel">Your first catch is waiting. Log one above to get started. 🎣</p>
+      </section>
+
+      <section id="insights-tab" class="tab-panel" hidden>
+        <div class="section-heading">
+          <div><p class="eyebrow">LET THE LOG TELL A STORY</p><h2>Catch insights</h2></div>
+        </div>
+        <div class="panel analytics-controls">
+          <label>Lure / bait
+            <select id="insights-bait"><option value="">All lures</option></select>
+          </label>
+          <p id="insights-summary" class="insights-summary">Log a catch to see patterns.</p>
+        </div>
+        <div class="chart-grid">
+          <article class="panel chart-panel">
+            <h3>Catches by species and lure</h3>
+            <p class="chart-description">With All lures selected, each fish shows the lure or lures it bit.</p>
+            <div id="species-chart" class="bar-chart"></div>
+          </article>
+          <article class="panel chart-panel"><h3>Catches by moon phase</h3><div id="moon-chart" class="bar-chart"></div></article>
+        </div>
+        <p class="muted small chart-note">Moon phase is estimated locally from catch date and time. These are catch counts, not catch rates; fishing effort isn't recorded.</p>
+      </section>
+    </main>
+    <footer><span>Built for days on the water.</span><span id="sync-detail"></span></footer>
+
+    <script>
+      if ("serviceWorker" in navigator && location.protocol !== "file:") {
+        window.addEventListener("load", () => navigator.serviceWorker.register("/service-worker.js").catch(() => {}));
+      }
+    </script>
+  </body>
+</html>
