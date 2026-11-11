@@ -132,7 +132,7 @@
         <p class="muted recommendation-intro">Get separate day and night lure picks based on local forecast, season, and recent measured water temperature when available. Picks are transparent fishing heuristics—not live fish tracking or a guaranteed bite.</p>
         <form id="recommendation-form" class="panel recommendation-form">
           <div class="recommendation-fields">
-            <label>Lake, river, or waterbody<input id="recommendation-water" name="water_body" type="text" minlength="2" maxlength="100" placeholder="e.g., Carnegie Lake" required></label>
+            <label>Body of water<input id="recommendation-water" name="water_body" type="text" minlength="2" maxlength="100" placeholder="e.g., Carnegie Lake" required></label>
             <label>State
               <select id="recommendation-state" name="state" required>
                 <option value="">Choose a state</option>
@@ -151,7 +151,6 @@
                 <option value="WI">Wisconsin</option><option value="WY">Wyoming</option>
               </select>
             </label>
-            <label>ZIP code near the water<input id="recommendation-zip" name="zip_code" type="text" inputmode="numeric" autocomplete="postal-code" pattern="[0-9]{5}" maxlength="5" placeholder="e.g., 08540" required></label>
             <label>Target fish <span class="muted">(optional)</span>
               <select id="recommendation-species" name="target_species">
                 <option value="">Bass-first suggestions</option>
@@ -161,7 +160,7 @@
             </label>
           </div>
           <div class="recommendation-submit">
-            <p class="muted small">ZIP and state must match. Use a ZIP close to the fishing spot for a more relevant forecast.</p>
+            <p class="muted small">No ZIP needed. We’ll locate the named waterbody in the selected state. If the name is ambiguous, we’ll ask you to add a nearby town or county.</p>
             <button id="recommendation-submit" class="button button-primary" type="submit">Build my report <span aria-hidden="true">→</span></button>
           </div>
           <p id="recommendation-message" class="form-message" role="status" aria-live="polite"></p>

@@ -3,10 +3,13 @@
 ## Shore lure guide
 
 The **Shore lure guide** tab creates separate day and night lure lists for a
-named waterbody, state, nearby ZIP code, and optional target fish. Leaving the
-fish blank gives bass-first suggestions. The report uses:
+named waterbody, state, and optional target fish. No ZIP code is needed.
+Leaving the fish blank gives bass-first suggestions. The report uses:
 
-- The National Weather Service API for a ZIP-area hourly forecast.
+- A matching USGS site, or OpenStreetMap geocoding when a matching USGS site
+  cannot be found, to locate the named waterbody within the selected state.
+- The National Weather Service API for an hourly forecast near the resolved
+  waterbody coordinates.
 - USGS Water Data for recent water-temperature readings and named lake/stream
   monitoring sites when available.
 - The current local calendar season and a calculated moon phase.
@@ -20,14 +23,18 @@ case the report says so and never substitutes air temperature for water
 temperature. When only a nearby sensor is available, the report shows its
 station, reading time, and distance. A failed data provider is reported rather
 than silently presented as a successful measurement. The weather forecast uses
-the ZIP area's forecast point and may not exactly represent a specific bank.
+the resolved waterbody's forecast grid and may not exactly represent a specific bank.
+Ambiguous or unverified locations are rejected rather than silently selecting
+the wrong waterbody.
 Water clarity, access, structure, forage, fishing pressure, and current fish
 location are not observed. Use the linked state-agency source to check current
 regulations, advisories, access, and seasonal guidance for the specific water.
 
 The recommendation endpoint uses free public services and does not require the
 OpenAI key or a signed-in catch account. It does require the server to have
-internet access to the ZIP lookup, National Weather Service, and USGS services.
+internet access to OpenStreetMap, National Weather Service, and USGS services.
+OpenStreetMap is used as the named-waterbody geocoder when USGS does not return
+a confident matching site; its results are attributed in the report.
 
 This is the phone-friendly, installable web app with a Supabase-backed catch
 log. The Tkinter desktop app is a separate client for now and has not been

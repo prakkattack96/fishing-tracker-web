@@ -326,7 +326,7 @@ input[type="file"]::file-selector-button {
 .form-message.error { color: var(--danger); }
 .recommendation-intro { max-width: 760px; margin: -4px 0 16px; line-height: 1.55; }
 .recommendation-form { padding: 20px; }
-.recommendation-fields { display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr; gap: 13px; }
+.recommendation-fields { display: grid; grid-template-columns: 1.4fr 1fr 1fr; gap: 13px; }
 .recommendation-submit { display: flex; align-items: center; justify-content: space-between; gap: 15px; margin-top: 16px; }
 .recommendation-submit p { margin: 0; }
 .recommendation-results { display: grid; gap: 14px; margin-top: 20px; }

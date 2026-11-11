@@ -8,6 +8,8 @@ import json
 import math
 import os
 import re
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
@@ -27,7 +29,6 @@ APP_DIRECTORY = Path(__file__).resolve().parent
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_SPECIES = 150
-ZIP_CODE_PATTERN = re.compile(r"^\d{5}$")
 STATES = {
     "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
     "CA": "California", "CO": "Colorado", "CT": "Connecticut", "DE": "Delaware",
@@ -99,6 +100,8 @@ RECOMMENDATION_SPECIES = (
     "Largemouth Bass", "Smallmouth Bass", "Crappie", "Walleye",
     "Northern Pike", "Catfish", "Trout",
 )
+_geocoder_lock = threading.Lock()
+_last_geocoder_request = 0.0
 
 app = FastAPI(title="Fishing Tracker API", version="0.1.0")
 allowed_origins = [
@@ -135,7 +138,6 @@ class IdentifyResponse(BaseModel):
 class RecommendationRequest(BaseModel):
     water_body: str = Field(min_length=2, max_length=100)
     state: str = Field(min_length=2, max_length=2)
-    zip_code: str = Field(min_length=5, max_length=5)
     target_species: str = Field(default="", max_length=40)
 
 
@@ -188,40 +190,173 @@ def _external_text(url: str, source: str) -> str:
     return result
 
 
-def _zip_location(zip_code: str) -> dict:
+def _nominatim_locations(query: str) -> list:
+    global _last_geocoder_request
+    with _geocoder_lock:
+        wait = 1.0 - (time.monotonic() - _last_geocoder_request)
+        if wait > 0:
+            time.sleep(wait)
+        request = Request(
+            "https://nominatim.openstreetmap.org/search?"
+            + urlencode(
+                {
+                    "q": query,
+                    "format": "jsonv2",
+                    "addressdetails": 1,
+                    "limit": 5,
+                    "countrycodes": "us",
+                }
+            ),
+            headers={
+                "Accept": "application/json",
+                "User-Agent": (
+                    "FishingTracker/1.0 "
+                    "(https://github.com/prakkattack96/fishing-tracker-web)"
+                ),
+            },
+        )
+        _last_geocoder_request = time.monotonic()
+        try:
+            with urlopen(request, timeout=15) as response:
+                result = json.loads(response.read())
+        except HTTPError as error:
+            raise DataSourceError(
+                "OpenStreetMap geocoder",
+                f"OpenStreetMap geocoder returned HTTP {error.code}.",
+                error.code,
+            ) from error
+        except (URLError, TimeoutError, OSError) as error:
+            raise DataSourceError(
+                "OpenStreetMap geocoder", "Could not reach OpenStreetMap geocoder."
+            ) from error
+        except json.JSONDecodeError as error:
+            raise DataSourceError(
+                "OpenStreetMap geocoder", "OpenStreetMap geocoder returned invalid data."
+            ) from error
+    if not isinstance(result, list):
+        raise DataSourceError(
+            "OpenStreetMap geocoder", "OpenStreetMap geocoder returned unexpected data."
+        )
+    return result
+
+
+def _resolve_named_waterbody(water_body: str, state: str) -> dict:
+    site, site_error = _waterbody_site(water_body, state)
+    if site:
+        return {
+            "latitude": site["latitude"],
+            "longitude": site["longitude"],
+            "place": site["station_nm"],
+            "reference": f"USGS site {site['site_no']} ({site['station_nm']})",
+            "provider": "USGS",
+            "site": {
+                "name": site["station_nm"],
+                "site_type": site["site_tp_cd"],
+                "site_number": site["site_no"],
+            },
+        }
+
+    query = f"{water_body}, {STATES[state]}, United States"
     try:
-        result = _external_json(f"https://api.zippopotam.us/us/{zip_code}", "ZIP lookup")
+        candidates = _nominatim_locations(query)
     except DataSourceError as error:
-        if error.status == 404:
-            raise HTTPException(status_code=422, detail="That ZIP code was not found.") from error
-        raise HTTPException(status_code=502, detail=str(error)) from error
-    places = result.get("places")
-    if not isinstance(places, list) or not places or not isinstance(places[0], dict):
-        raise HTTPException(status_code=502, detail="ZIP lookup did not return a location.")
-    place = places[0]
-    try:
-        latitude = float(place["latitude"])
-        longitude = float(place["longitude"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise HTTPException(status_code=502, detail="ZIP lookup returned invalid coordinates.") from error
-    return {
-        "zip_code": zip_code,
-        "place": str(place.get("place name", "")),
-        "state": str(place.get("state abbreviation", "")).upper(),
-        "latitude": latitude,
-        "longitude": longitude,
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Could not look up that waterbody by name. "
+                "Please try again in a moment."
+                + (f" {site_error}" if site_error else "")
+            ),
+        ) from error
+
+    query_tokens = {
+        token
+        for token in re.findall(r"[a-z0-9]+", water_body.casefold())
+        if token not in {"lake", "river", "stream", "creek", "pond", "reservoir", "water"}
     }
-
-
-def _nws_forecast(location: dict, expected_state: str) -> tuple[dict, str, datetime]:
-    if location["state"] != expected_state:
+    matches = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        address = candidate.get("address")
+        if not isinstance(address, dict):
+            continue
+        candidate_state = str(address.get("state", "")).casefold()
+        state_code = str(address.get("ISO3166-2-lvl4", "")).split("-")[-1].upper()
+        if candidate_state != STATES[state].casefold() and state_code != state:
+            continue
+        name = str(candidate.get("name", ""))
+        display_name = str(candidate.get("display_name", ""))
+        searchable_name = f"{name} {display_name}".casefold()
+        candidate_tokens = set(re.findall(r"[a-z0-9]+", searchable_name))
+        feature_class = str(candidate.get("class", "")).casefold()
+        feature_type = str(candidate.get("type", "")).casefold()
+        if (
+            feature_class and feature_class not in {"natural", "water", "waterway"}
+        ) or feature_type not in {
+            "bay",
+            "canal",
+            "coastline",
+            "creek",
+            "lake",
+            "lagoon",
+            "pond",
+            "reservoir",
+            "river",
+            "riverbank",
+            "stream",
+            "water",
+            "wetland",
+        }:
+            continue
+        if query_tokens and not query_tokens.issubset(candidate_tokens):
+            continue
+        if not query_tokens and water_body.casefold() not in searchable_name:
+            continue
+        try:
+            latitude = float(candidate["lat"])
+            longitude = float(candidate["lon"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        matches.append(
+            {
+                "latitude": latitude,
+                "longitude": longitude,
+                "place": display_name or name or water_body,
+                "reference": f"OpenStreetMap result: {display_name or name or water_body}",
+                "provider": "OpenStreetMap",
+                "site": None,
+            }
+        )
+    if not matches:
+        detail = (
+            f"USGS could not verify a named site ({site_error}). "
+            if site_error
+            else ""
+        )
         raise HTTPException(
             status_code=422,
             detail=(
-                f"ZIP {location['zip_code']} is in {STATES.get(location['state'], location['state'])}, "
-                f"not {STATES[expected_state]}. Use a ZIP near the water in the selected state."
+                f"Could not confidently locate “{water_body}” in {STATES[state]}. "
+                f"{detail}Try a more specific waterbody name."
             ),
         )
+    if len(matches) > 1:
+        coordinates = {
+            (match["latitude"], match["longitude"]) for match in matches
+        }
+        if len(coordinates) > 1:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"More than one place named “{water_body}” was found in {STATES[state]}. "
+                    "Please include a nearby town or county in the waterbody name."
+                ),
+            )
+    return matches[0]
+
+
+def _nws_forecast(location: dict) -> tuple[dict, str, datetime]:
     latitude = location["latitude"]
     longitude = location["longitude"]
     try:
@@ -241,7 +376,7 @@ def _nws_forecast(location: dict, expected_state: str) -> tuple[dict, str, datet
     except (KeyError, TypeError, ZoneInfoNotFoundError) as error:
         raise HTTPException(
             status_code=502,
-            detail="The National Weather Service could not identify a forecast for that ZIP code.",
+            detail="The National Weather Service could not identify a forecast for that waterbody location.",
         ) from error
     if not isinstance(forecast_url, str) or not forecast_url.startswith("https://api.weather.gov/"):
         raise HTTPException(
@@ -360,12 +495,19 @@ def _parse_usgs_sites(text: str) -> list[dict]:
 
 
 def _waterbody_site(water_body: str, state: str) -> tuple[dict | None, str | None]:
+    query_tokens = {
+        token
+        for token in re.findall(r"[a-z0-9]+", water_body.casefold())
+        if token not in {"lake", "river", "stream", "creek", "pond", "reservoir", "water"}
+    }
+    if not query_tokens:
+        return None, None
+    search_term = max(query_tokens, key=len)
     query = urlencode(
         {
             "format": "rdb",
             "stateCd": state,
-            "siteName": water_body,
-            "siteNameMatchOperator": "contains",
+            "siteName": search_term,
             "siteStatus": "all",
             "siteType": "LK,ST",
         }
@@ -375,17 +517,29 @@ def _waterbody_site(water_body: str, state: str) -> tuple[dict | None, str | Non
             _external_text(f"https://waterservices.usgs.gov/nwis/site/?{query}", "USGS water data")
         )
     except DataSourceError as error:
+        if error.status == 404:
+            return None, None
         return None, str(error)
     if not sites:
         return None, None
-    query_words = set(re.findall(r"[a-z0-9]+", water_body.casefold()))
-
-    def score(site: dict) -> tuple[int, int]:
+    query_phrase = " ".join(re.findall(r"[a-z0-9]+", water_body.casefold()))
+    matches = []
+    for site in sites:
         name = str(site.get("station_nm", "")).casefold()
-        overlap = len(query_words.intersection(re.findall(r"[a-z0-9]+", name)))
-        return (int(water_body.casefold() in name), overlap + int(site.get("site_tp_cd") == "LK") * 2)
-
-    return max(sites, key=score), None
+        name_tokens = set(re.findall(r"[a-z0-9]+", name))
+        if not query_tokens.issubset(name_tokens):
+            continue
+        normalized_name = " ".join(re.findall(r"[a-z0-9]+", name))
+        matches.append(
+            (
+                int(query_phrase in normalized_name),
+                int(site.get("site_tp_cd") == "LK"),
+                site,
+            )
+        )
+    if not matches:
+        return None, None
+    return max(matches, key=lambda match: (match[0], match[1]))[2], None
 
 
 def _distance_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -505,7 +659,7 @@ def _water_temperature(center: dict) -> dict:
         "https://waterdata.usgs.gov/monitoring-location/"
         + reading["site_id"].removeprefix("USGS-")
     )
-    reading["distance_reference"] = center.get("reference", "ZIP-code center")
+    reading["distance_reference"] = center.get("reference", "waterbody location")
     reading["message"] = (
         "This is the nearest recent monitored reading, not a measurement taken at the fishing spot."
     )
@@ -527,7 +681,7 @@ def _moon_phase(local_now: datetime) -> dict:
         "phase": names[index],
         "illumination_percent": round(illumination),
         "local_date": local_now.date().isoformat(),
-        "note": "The phase is global; the ZIP code sets the local date and time used in this estimate.",
+        "note": "The phase is global; the waterbody location sets the local date and time used in this estimate.",
     }
 
 
@@ -746,9 +900,6 @@ def build_recommendation_report(payload: RecommendationRequest) -> dict:
     state = payload.state.strip().upper()
     if state not in STATES:
         raise HTTPException(status_code=422, detail="Choose a U.S. state from the list.")
-    zip_code = payload.zip_code.strip()
-    if not ZIP_CODE_PATTERN.fullmatch(zip_code):
-        raise HTTPException(status_code=422, detail="Enter a valid five-digit U.S. ZIP code.")
     water_body = payload.water_body.strip()
     if len(water_body) < 2:
         raise HTTPException(status_code=422, detail="Enter the name of the lake, river, or other waterbody.")
@@ -764,39 +915,17 @@ def build_recommendation_report(payload: RecommendationRequest) -> dict:
         (item for item in RECOMMENDATION_SPECIES if item.casefold() == target_species.casefold()),
         "Largemouth Bass",
     )
-    location = _zip_location(zip_code)
-    weather, timezone_name, local_now = _nws_forecast(location, state)
-    nearest_water, site_search_error = _waterbody_site(water_body, state)
-    if nearest_water:
-        center = {
-            "latitude": nearest_water["latitude"],
-            "longitude": nearest_water["longitude"],
-            "reference": f"USGS site {nearest_water['site_no']} ({nearest_water['station_nm']})",
-        }
-    else:
-        center = {
-            "latitude": location["latitude"],
-            "longitude": location["longitude"],
-            "reference": f"ZIP-code center ({location['zip_code']})",
-        }
-    water_temperature = _water_temperature(center)
-    if nearest_water:
-        water_temperature["waterbody_site"] = {
-            "name": nearest_water["station_nm"],
-            "site_type": nearest_water["site_tp_cd"],
-            "site_number": nearest_water["site_no"],
-        }
+    location = _resolve_named_waterbody(water_body, state)
+    weather, timezone_name, local_now = _nws_forecast(location)
+    water_temperature = _water_temperature(location)
+    if location["site"]:
+        water_temperature["waterbody_site"] = location["site"]
     else:
         water_temperature["waterbody_site"] = None
         water_temperature["waterbody_site_message"] = (
-            f"No matching USGS lake/stream site was found by name for {water_body}. "
-            "The nearest-temperature search is centered on the ZIP-code location instead."
+            "The waterbody location was identified from OpenStreetMap; USGS may or may not have "
+            "a temperature sensor at this exact water."
         )
-        if site_search_error:
-            water_temperature["waterbody_site_message"] = (
-                f"USGS could not check for a named site for {water_body}: {site_search_error} "
-                "The nearest-temperature search is centered on the ZIP-code location instead."
-            )
     temp = water_temperature.get("temperature_f") if water_temperature.get("available") else None
     season = _season_for(local_now.month)
     moon = _moon_phase(local_now)
@@ -823,7 +952,8 @@ def build_recommendation_report(payload: RecommendationRequest) -> dict:
         "Lure picks are transparent seasonal/temperature heuristics, not an AI-generated catch guarantee or a live fish-activity report.",
         "The behavior context is a general heuristic; NWS and USGS do not provide real-time fish activity or verified bite reports for this waterbody.",
         "Water temperature is measured at the named waterbody only when a matching USGS site and recent sensor reading are available; otherwise the nearest recent USGS sensor is used and its distance is shown.",
-        "Weather comes from the ZIP-code forecast point. A ZIP centroid and forecast grid may not exactly match the bank you will fish.",
+        "Weather comes from the National Weather Service forecast grid at the resolved waterbody coordinates; a forecast grid may not exactly match the bank you will fish.",
+        "Waterbody coordinates are resolved from a matching USGS site when possible, otherwise from OpenStreetMap results verified against the selected state. Ambiguous names are rejected instead of silently choosing a location.",
         "The report cannot observe local water clarity, structure, access, fishing pressure, or current fish location. Treat each as a factor to verify at the bank.",
         "Check the linked state agency for current seasons, size/bag limits, access rules, and any waterbody-specific advisories before fishing.",
     ]
@@ -835,6 +965,13 @@ def build_recommendation_report(payload: RecommendationRequest) -> dict:
         "season": season,
         "moon": moon,
         "weather": weather,
+        "location_resolution": {
+            "place": location["place"],
+            "provider": location["provider"],
+            "reference": location["reference"],
+            "latitude": location["latitude"],
+            "longitude": location["longitude"],
+        },
         "water_temperature": water_temperature,
         "recommendations": recommendations,
         "behavior_context": _behavior_context(target_species, temp, season),
@@ -881,7 +1018,7 @@ def build_recommendation_report(payload: RecommendationRequest) -> dict:
             {
                 "name": "National Weather Service hourly forecast",
                 "url": "https://www.weather.gov/documentation/services-web-api",
-                "description": "Government forecast and weather conditions for the ZIP-code area.",
+                "description": "Government forecast and weather conditions near the resolved waterbody coordinates.",
             },
             {
                 "name": "USGS measured water temperature",
@@ -890,9 +1027,20 @@ def build_recommendation_report(payload: RecommendationRequest) -> dict:
             },
             state_source,
             {
-                "name": "ZIP-code lookup",
-                "url": "https://api.zippopotam.us/",
-                "description": "Used only to place the weather forecast and local moon-phase date.",
+                "name": "Waterbody location",
+                "url": (
+                    "https://waterdata.usgs.gov/"
+                    if location["provider"] == "USGS"
+                    else "https://www.openstreetmap.org/copyright"
+                ),
+                "description": (
+                    f"Location resolved by {location['provider']}: {location['place']}. "
+                    + (
+                        "© OpenStreetMap contributors."
+                        if location["provider"] == "OpenStreetMap"
+                        else ""
+                    )
+                ),
             },
         ],
         "timezone": timezone_name,

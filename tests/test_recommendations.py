@@ -9,6 +9,16 @@ import server
 
 
 class RecommendationTests(unittest.TestCase):
+    def test_api_accepts_waterbody_and_state_without_a_zip(self):
+        response_body = {"water_body": "Carnegie Lake", "state": "NJ"}
+        payload = server.RecommendationRequest.model_validate(
+            {"water_body": "Carnegie Lake", "state": "NJ"}
+        )
+        with patch.object(server, "build_recommendation_report", return_value=response_body):
+            response = server.recommendations(payload)
+
+        self.assertEqual(response, response_body)
+
     def test_report_has_day_and_night_picks(self):
         now = datetime.now(ZoneInfo("America/New_York"))
         weather = {
@@ -23,18 +33,16 @@ class RecommendationTests(unittest.TestCase):
             "nighttime": {"maximum_wind_mph": 4},
         }
         location = {
-            "zip_code": "08540",
-            "place": "Princeton",
-            "state": "NJ",
             "latitude": 40.35,
             "longitude": -74.66,
-        }
-        site = {
-            "latitude": 40.35,
-            "longitude": -74.66,
-            "site_no": "01400000",
-            "station_nm": "Carnegie Lake",
-            "site_tp_cd": "LK",
+            "place": "Carnegie Lake",
+            "reference": "USGS site 01400000 (Carnegie Lake)",
+            "provider": "USGS",
+            "site": {
+                "name": "Carnegie Lake",
+                "site_type": "LK",
+                "site_number": "01400000",
+            },
         }
         temperature = {
             "available": True,
@@ -44,18 +52,17 @@ class RecommendationTests(unittest.TestCase):
             "distance_reference": "USGS site",
         }
         with (
-            patch.object(server, "_zip_location", return_value=location),
+            patch.object(server, "_resolve_named_waterbody", return_value=location),
             patch.object(
                 server,
                 "_nws_forecast",
                 return_value=(weather, "America/New_York", now),
             ),
-            patch.object(server, "_waterbody_site", return_value=(site, None)),
             patch.object(server, "_water_temperature", return_value=temperature),
         ):
             report = server.build_recommendation_report(
                 server.RecommendationRequest(
-                    water_body="Carnegie Lake", state="NJ", zip_code="08540"
+                    water_body="Carnegie Lake", state="NJ"
                 )
             )
 
@@ -64,16 +71,44 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(report["recommendations"]["species"], "Largemouth Bass")
         self.assertEqual(report["water_temperature"]["temperature_f"], 62.6)
         self.assertEqual(report["state"]["code"], "NJ")
+        self.assertEqual(report["location_resolution"]["provider"], "USGS")
 
-    def test_state_zip_mismatch_is_rejected(self):
-        location = {"zip_code": "08540", "state": "NJ"}
-        with patch.object(
-            server,
-            "_external_json",
-            side_effect=AssertionError("should not make NWS request"),
+    def test_location_search_accepts_waterbody_in_selected_state(self):
+        candidate = {
+            "lat": "40.35",
+            "lon": "-74.66",
+            "name": "Carnegie Lake",
+            "display_name": "Carnegie Lake, Princeton, New Jersey, United States",
+            "type": "reservoir",
+            "address": {"state": "New Jersey", "ISO3166-2-lvl4": "US-NJ"},
+        }
+        with (
+            patch.object(server, "_waterbody_site", return_value=(None, None)),
+            patch.object(server, "_nominatim_locations", return_value=[candidate]),
+        ):
+            location = server._resolve_named_waterbody("Carnegie Lake", "NJ")
+
+        self.assertEqual(location["provider"], "OpenStreetMap")
+        self.assertEqual(location["latitude"], 40.35)
+        self.assertIn("Carnegie Lake", location["place"])
+
+    def test_location_search_rejects_a_result_in_another_state(self):
+        candidate = {
+            "lat": "40.35",
+            "lon": "-74.66",
+            "name": "Carnegie Lake",
+            "display_name": "Carnegie Lake, Pennsylvania, United States",
+            "class": "natural",
+            "type": "water",
+            "address": {"state": "Pennsylvania", "ISO3166-2-lvl4": "US-PA"},
+        }
+        with (
+            patch.object(server, "_waterbody_site", return_value=(None, None)),
+            patch.object(server, "_nominatim_locations", return_value=[candidate]),
         ):
             with self.assertRaises(HTTPException) as raised:
-                server._nws_forecast(location, "PA")
+                server._resolve_named_waterbody("Carnegie Lake", "NJ")
+
         self.assertEqual(raised.exception.status_code, 422)
 
     def test_missing_temperature_uses_season_not_air_temperature(self):

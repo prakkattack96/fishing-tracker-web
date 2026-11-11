@@ -634,7 +634,7 @@ function renderRecommendationReport(report) {
   const facts = [
     ["Water temperature", waterText],
     ["Moon", `${report.moon.phase} · ${report.moon.illumination_percent}% illumination`],
-    ["ZIP area", `${report.location.place}, ${report.state.code} ${report.location.zip_code}`],
+    ["Waterbody location", `${report.location_resolution.place} · located with ${report.location_resolution.provider}`],
     ["Forecast date", `${report.weather.forecast_date} · ${report.weather.local_time_zone}`]
   ];
   for (const [label, value] of facts) {
@@ -735,7 +735,7 @@ async function submitRecommendation(event) {
   const message = $("#recommendation-message");
   button.disabled = true;
   button.textContent = "Gathering local conditions…";
-  setMessage(message, "Checking ZIP, weather, and nearby USGS measurements. This may take a few seconds.");
+  setMessage(message, "Locating the waterbody and checking the local forecast and USGS measurements. This may take a few seconds.");
   try {
     const report = await fetchJson(`${(CONFIG.apiBaseUrl || "").replace(/\/$/, "")}/api/recommendations`, {
       method: "POST",
@@ -743,7 +743,6 @@ async function submitRecommendation(event) {
       body: JSON.stringify({
         water_body: $("#recommendation-water").value.trim(),
         state: $("#recommendation-state").value,
-        zip_code: $("#recommendation-zip").value.trim(),
         target_species: $("#recommendation-species").value
       })
     });
