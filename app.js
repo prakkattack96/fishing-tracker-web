@@ -133,7 +133,10 @@ async function fetchJson(url, options = {}) {
     }
   }
   if (!response.ok) {
-    const message = result?.msg || result?.message || result?.error_description || result?.error || result?.details || `Request failed (${response.status}).`;
+    const detail = Array.isArray(result?.detail)
+      ? result.detail.map((item) => item?.msg).filter(Boolean).join("; ")
+      : result?.detail;
+    const message = detail || result?.msg || result?.message || result?.error_description || result?.error || result?.details || `Request failed (${response.status}).`;
     throw new Error(typeof message === "string" ? message : `Request failed (${response.status}).`);
   }
   return result;
@@ -598,6 +601,162 @@ function setMessage(element, message, error = false) {
   element.classList.toggle("error", error);
 }
 
+function reportElement(tag, className = "", text = "") {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  element.textContent = text;
+  return element;
+}
+
+function renderRecommendationReport(report) {
+  const container = $("#recommendation-results");
+  container.replaceChildren();
+  container.hidden = false;
+
+  const heading = reportElement(
+    "h2",
+    "",
+    `${report.water_body} · ${report.state.name} · ${report.local_date}`
+  );
+  const intro = reportElement(
+    "p",
+    "muted",
+    `Shore-casting guide for ${report.recommendations.species}. ${report.season[0].toUpperCase()}${report.season.slice(1)} season.`
+  );
+  const overview = reportElement("section", "panel recommendation-overview");
+  overview.append(heading, intro);
+
+  const water = report.water_temperature;
+  const waterText = water.available
+    ? `${water.temperature_f}°F · ${water.station_name || water.site_id} · ${water.distance_miles} mi from ${water.distance_reference}`
+    : water.message;
+  const overviewGrid = reportElement("div", "report-facts");
+  const facts = [
+    ["Water temperature", waterText],
+    ["Moon", `${report.moon.phase} · ${report.moon.illumination_percent}% illumination`],
+    ["ZIP area", `${report.location.place}, ${report.state.code} ${report.location.zip_code}`],
+    ["Forecast date", `${report.weather.forecast_date} · ${report.weather.local_time_zone}`]
+  ];
+  for (const [label, value] of facts) {
+    const fact = reportElement("article", "report-fact");
+    fact.append(reportElement("strong", "", label), reportElement("span", "", value));
+    overviewGrid.append(fact);
+  }
+  overview.append(overviewGrid);
+  overview.append(reportElement("p", "muted small report-caveat", water.message));
+  if (water.waterbody_site_message) {
+    overview.append(reportElement("p", "muted small report-caveat", water.waterbody_site_message));
+  }
+
+  const weather = report.weather;
+  const forecast = reportElement("section", "panel report-weather");
+  forecast.append(reportElement("h3", "", "Local weather forecast"));
+  const weatherGrid = reportElement("div", "report-facts");
+  for (const [label, period] of [["Daytime", weather.daytime], ["Nighttime", weather.nighttime]]) {
+    const description = period
+      ? `${period.conditions || "Conditions unavailable"} · ${
+          period.temperature_low_f === null || period.temperature_high_f === null
+            ? "temperature unavailable"
+            : `${period.temperature_low_f}–${period.temperature_high_f}°F`
+        } · wind ${period.wind || "unavailable"}`
+      : "Forecast unavailable for this period.";
+    const item = reportElement("article", "report-fact");
+    item.append(reportElement("strong", "", label), reportElement("span", "", description));
+    if (period?.maximum_precipitation_chance_percent !== null && period?.maximum_precipitation_chance_percent !== undefined) {
+      item.append(reportElement("small", "muted", `Max precipitation chance: ${period.maximum_precipitation_chance_percent}%`));
+    }
+    weatherGrid.append(item);
+  }
+  forecast.append(weatherGrid);
+
+  const context = reportElement("section", "panel report-tactics");
+  context.append(
+    reportElement("h3", "", "Fish behavior and decision factors"),
+    reportElement("p", "muted behavior-context", report.behavior_context)
+  );
+  const factorList = document.createElement("ul");
+  for (const factor of report.decision_factors) {
+    factorList.append(
+      reportElement("li", "", `${factor.factor}: ${factor.use}`)
+    );
+  }
+  context.append(factorList);
+
+  const lureGrid = reportElement("div", "lure-recommendation-grid");
+  for (const [periodName, picks] of [["Day picks", report.recommendations.day], ["Night picks", report.recommendations.night]]) {
+    const panel = reportElement("section", "panel lure-panel");
+    panel.append(reportElement("h3", "", `Top 3 ${periodName.toLowerCase()}`));
+    const list = document.createElement("ol");
+    list.className = "lure-picks";
+    for (const pick of picks) {
+      const item = document.createElement("li");
+      item.append(reportElement("strong", "", pick.lure), reportElement("p", "muted", pick.why));
+      list.append(item);
+    }
+    panel.append(list);
+    lureGrid.append(panel);
+  }
+
+  const tactics = reportElement("section", "panel report-tactics");
+  tactics.append(reportElement("h3", "", "Shore-casting notes"));
+  const tacticsList = document.createElement("ul");
+  for (const tip of report.recommendations.shore_tips) {
+    tacticsList.append(reportElement("li", "", tip));
+  }
+  tactics.append(tacticsList);
+
+  const sources = reportElement("section", "panel report-sources");
+  sources.append(reportElement("h3", "", "Sources and what to verify"));
+  const sourceList = document.createElement("ul");
+  for (const source of report.sources) {
+    const item = document.createElement("li");
+    const link = document.createElement("a");
+    link.href = source.url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = source.name;
+    item.append(link, reportElement("span", "muted", ` — ${source.description}`));
+    sourceList.append(item);
+  }
+  sources.append(sourceList);
+  const limitations = document.createElement("ul");
+  limitations.className = "report-limitations";
+  for (const note of report.data_notes) limitations.append(reportElement("li", "", note));
+  sources.append(limitations);
+
+  container.append(overview, forecast, context, lureGrid, tactics, sources);
+}
+
+async function submitRecommendation(event) {
+  event.preventDefault();
+  const form = $("#recommendation-form");
+  if (!form.reportValidity()) return;
+  const button = $("#recommendation-submit");
+  const message = $("#recommendation-message");
+  button.disabled = true;
+  button.textContent = "Gathering local conditions…";
+  setMessage(message, "Checking ZIP, weather, and nearby USGS measurements. This may take a few seconds.");
+  try {
+    const report = await fetchJson(`${(CONFIG.apiBaseUrl || "").replace(/\/$/, "")}/api/recommendations`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        water_body: $("#recommendation-water").value.trim(),
+        state: $("#recommendation-state").value,
+        zip_code: $("#recommendation-zip").value.trim(),
+        target_species: $("#recommendation-species").value
+      })
+    });
+    renderRecommendationReport(report);
+    setMessage(message, "Report ready. Conditions and readings may change; verify before heading out.");
+  } catch (error) {
+    setMessage(message, `Could not build the report: ${error.message}`, true);
+  } finally {
+    button.disabled = false;
+    button.innerHTML = 'Build my report <span aria-hidden="true">→</span>';
+  }
+}
+
 async function identifyPhoto() {
   if (!state.photo) return setMessage(catchMessage, "Choose a photo first.", true);
   if (!$("#ai-consent").checked) return setMessage(catchMessage, "Check the consent box before sending the photo to AI.", true);
@@ -857,6 +1016,7 @@ function initializeTabs() {
       });
       $("#journal-tab").hidden = button.dataset.tab !== "journal";
       $("#insights-tab").hidden = button.dataset.tab !== "insights";
+      $("#recommendations-tab").hidden = button.dataset.tab !== "recommendations";
       if (button.dataset.tab === "insights") renderInsights();
     });
   });
@@ -889,6 +1049,7 @@ async function initialize() {
   });
   $("#sign-out-button").addEventListener("click", () => state.client?.signOut());
   $("#catch-form").addEventListener("submit", handleCatchSubmit);
+  $("#recommendation-form").addEventListener("submit", submitRecommendation);
   $("#catch-photo").addEventListener("change", (event) => preparePhoto(event.target.files?.[0]));
   $("#identify-button").addEventListener("click", identifyPhoto);
   $("#clear-photo").addEventListener("click", () => {

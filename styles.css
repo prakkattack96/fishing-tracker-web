@@ -323,6 +323,36 @@ input[type="file"]::file-selector-button {
 .bar-value { color: var(--gold); font-size: .78rem; font-weight: 800; text-align: right; }
 .chart-empty { padding: 30px 8px; color: var(--muted); font-size: .83rem; text-align: center; }
 .chart-note { margin: 12px 3px; }
+.form-message.error { color: var(--danger); }
+.recommendation-intro { max-width: 760px; margin: -4px 0 16px; line-height: 1.55; }
+.recommendation-form { padding: 20px; }
+.recommendation-fields { display: grid; grid-template-columns: 1.4fr 1fr 1fr 1fr; gap: 13px; }
+.recommendation-submit { display: flex; align-items: center; justify-content: space-between; gap: 15px; margin-top: 16px; }
+.recommendation-submit p { margin: 0; }
+.recommendation-results { display: grid; gap: 14px; margin-top: 20px; }
+.recommendation-overview, .report-weather, .report-tactics, .report-sources { padding: 19px; }
+.recommendation-overview h2 { margin: 0 0 7px; font-size: 1.35rem; }
+.recommendation-overview > p { margin: 0 0 15px; }
+.report-facts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.report-fact { display: grid; gap: 5px; min-width: 0; padding: 12px; border: 1px solid var(--border); border-radius: 11px; background: rgb(8 24 39 / 38%); }
+.report-fact strong { color: var(--teal-soft); font-size: .76rem; }
+.report-fact span { font-size: .85rem; line-height: 1.4; overflow-wrap: anywhere; }
+.report-fact small { font-size: .72rem; }
+.report-caveat { margin: 12px 0 0 !important; line-height: 1.5; }
+.report-weather h3, .lure-panel h3, .report-tactics h3, .report-sources h3 { margin: 0 0 13px; font-size: .98rem; }
+.lure-recommendation-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.lure-panel { padding: 19px; }
+.lure-picks { display: grid; gap: 10px; margin: 0; padding-left: 22px; }
+.lure-picks li { padding-left: 3px; }
+.lure-picks li::marker { color: var(--gold); font-weight: 800; }
+.lure-picks strong { color: var(--teal-soft); font-size: .92rem; }
+.lure-picks p { margin: 5px 0 0; font-size: .78rem; line-height: 1.5; }
+.report-tactics ul, .report-sources ul { display: grid; gap: 8px; margin: 0; padding-left: 20px; color: #dceae6; font-size: .82rem; line-height: 1.5; }
+.behavior-context { margin: 0 0 12px; font-size: .83rem; line-height: 1.55; }
+.report-tactics li::marker, .report-sources li::marker { color: var(--teal); }
+.report-sources a { color: var(--teal-soft); font-weight: 700; }
+.report-sources a:hover { color: var(--gold); }
+.report-limitations { margin-top: 14px !important; padding-top: 12px !important; border-top: 1px solid var(--border); color: var(--muted) !important; font-size: .76rem !important; }
 footer { display: flex; justify-content: space-between; gap: 10px; max-width: 1180px; margin: auto; padding: 18px 28px 28px; color: #7897a4; font-size: .75rem; }
 
 @media (max-width: 760px) {
@@ -358,6 +388,11 @@ footer { display: flex; justify-content: space-between; gap: 10px; max-width: 11
   .analytics-controls { grid-template-columns: 1fr; gap: 12px; }
   .chart-grid { grid-template-columns: 1fr; }
   .chart-panel { min-height: 220px; padding: 15px; }
+  .recommendation-fields { grid-template-columns: 1fr 1fr; }
+  .recommendation-submit { align-items: flex-start; flex-direction: column; }
+  .recommendation-submit .button { width: 100%; }
+  .lure-recommendation-grid { grid-template-columns: 1fr; }
+  .recommendation-overview, .report-weather, .report-tactics, .report-sources, .lure-panel { padding: 15px; }
   footer { padding: 15px; font-size: .69rem; }
 }
 
@@ -367,6 +402,7 @@ footer { display: flex; justify-content: space-between; gap: 10px; max-width: 11
   .button-row { flex-wrap: wrap; }
   .form-grid { grid-template-columns: 1fr; }
   .form-grid .wide { grid-column: 1; }
+  .recommendation-fields, .report-facts { grid-template-columns: 1fr; }
   .catch-card { grid-template-columns: 48px 1fr; }
   .catch-photo { width: 48px; height: 48px; }
 }
