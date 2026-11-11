@@ -1,4 +1,4 @@
-const CACHE_NAME = "fishing-tracker-shell-v5";
+const CACHE_NAME = "fishing-tracker-shell-v6";
 const APP_SHELL = [
   "/",
   "/index.html",

@@ -44,58 +44,6 @@ STATES = {
     "VT": "Vermont", "VA": "Virginia", "WA": "Washington", "WV": "West Virginia",
     "WI": "Wisconsin", "WY": "Wyoming",
 }
-STATE_FISHING_SOURCES = {
-    "AL": "https://www.outdooralabama.com/fishing/freshwater-fishing",
-    "AK": "https://www.adfg.alaska.gov/index.cfm?adfg=fishingSport.main",
-    "AZ": "https://www.azgfd.com/fishing/",
-    "AR": "https://www.agfc.com/fishing/",
-    "CA": "https://wildlife.ca.gov/Fishing/Inland",
-    "CO": "https://cpw.state.co.us/thingstodo/Pages/Fishing.aspx",
-    "CT": "https://portal.ct.gov/deep/fishing",
-    "DE": "https://dnrec.delaware.gov/fish-wildlife/fishing/",
-    "FL": "https://myfwc.com/fishing/freshwater/",
-    "GA": "https://georgiawildlife.com/fishing",
-    "HI": "https://dlnr.hawaii.gov/dofaw/",
-    "ID": "https://idfg.idaho.gov/fish",
-    "IL": "https://dnr.illinois.gov/fishing.html",
-    "IN": "https://www.in.gov/dnr/fish-and-wildlife/fishing/",
-    "IA": "https://www.iowadnr.gov/fishing",
-    "KS": "https://ksoutdoors.com/Fishing",
-    "KY": "https://fw.ky.gov/Fish/Pages/default.aspx",
-    "LA": "https://www.wlf.louisiana.gov/page/fishing",
-    "ME": "https://www.maine.gov/ifw/fishing-boating/fishing/",
-    "MD": "https://dnr.maryland.gov/fisheries/Pages/default.aspx",
-    "MA": "https://www.mass.gov/orgs/division-of-fisheries-and-wildlife",
-    "MI": "https://www.michigan.gov/dnr/things-to-do/fishing",
-    "MN": "https://www.dnr.state.mn.us/fishing/index.html",
-    "MS": "https://www.mdwfp.com/fishing-boating",
-    "MO": "https://mdc.mo.gov/fishing",
-    "MT": "https://fwp.mt.gov/fish",
-    "NE": "https://outdoornebraska.gov/fishing/",
-    "NV": "https://www.ndow.org/fish/",
-    "NH": "https://www.wildlife.nh.gov/fishing",
-    "NJ": "https://dep.nj.gov/njfw/fishing/freshwater/",
-    "NM": "https://www.wildlife.state.nm.us/fishing/",
-    "NY": "https://dec.ny.gov/things-to-do/freshwater-fishing",
-    "NC": "https://www.ncwildlife.org/Fishing",
-    "ND": "https://gf.nd.gov/fishing",
-    "OH": "https://www.fishwildlife.org/landing/membership/member-list",
-    "OK": "https://www.wildlifedepartment.com/fishing",
-    "OR": "https://myodfw.com/fishing",
-    "PA": "https://www.pa.gov/agencies/fishandboat/fishing.html",
-    "RI": "https://dem.ri.gov/natural-resources-bureau/fish-wildlife",
-    "SC": "https://www.dnr.sc.gov/fishing.html",
-    "SD": "https://gfp.sd.gov/fishing-boating/",
-    "TN": "https://www.tn.gov/twra/fishing.html",
-    "TX": "https://tpwd.texas.gov/fishboat/",
-    "UT": "https://wildlife.utah.gov/fishing",
-    "VT": "https://www.vtfishandwildlife.com/fish",
-    "VA": "https://dwr.virginia.gov/fishing/",
-    "WA": "https://wdfw.wa.gov/fishing",
-    "WV": "https://wvdnr.gov/fishing/",
-    "WI": "https://dnr.wisconsin.gov/topic/Fishing",
-    "WY": "https://wgfd.wyo.gov/fishing-boating",
-}
 RECOMMENDATION_SPECIES = (
     "Largemouth Bass", "Smallmouth Bass", "Crappie", "Walleye",
     "Northern Pike", "Catfish", "Trout",
@@ -356,7 +304,7 @@ def _resolve_named_waterbody(water_body: str, state: str) -> dict:
     return matches[0]
 
 
-def _nws_forecast(location: dict) -> tuple[dict, str, datetime]:
+def _local_time_and_wind(location: dict) -> tuple[str, datetime, dict]:
     latitude = location["latitude"]
     longitude = location["longitude"]
     try:
@@ -366,112 +314,53 @@ def _nws_forecast(location: dict) -> tuple[dict, str, datetime]:
         )
         properties = point.get("properties", {})
         if not isinstance(properties, dict):
-            raise TypeError("The forecast point has no properties.")
-        forecast_url = properties.get("forecastHourly")
+            raise TypeError("The location response has no properties.")
         timezone_name = str(properties.get("timeZone", ""))
         zone = ZoneInfo(timezone_name)
         local_now = datetime.now(zone)
+        forecast_url = properties.get("forecastHourly")
+        if not isinstance(forecast_url, str) or not forecast_url.startswith(
+            "https://api.weather.gov/"
+        ):
+            raise TypeError("The location response has no hourly forecast URL.")
+        forecast = _external_json(forecast_url, "National Weather Service")
     except DataSourceError as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
     except (KeyError, TypeError, ZoneInfoNotFoundError) as error:
         raise HTTPException(
             status_code=502,
-            detail="The National Weather Service could not identify a forecast for that waterbody location.",
+            detail="Could not determine local conditions for the waterbody.",
         ) from error
-    if not isinstance(forecast_url, str) or not forecast_url.startswith("https://api.weather.gov/"):
-        raise HTTPException(
-            status_code=502, detail="The National Weather Service did not provide an hourly forecast."
-        )
-    try:
-        forecast = _external_json(forecast_url, "National Weather Service")
-    except DataSourceError as error:
-        raise HTTPException(status_code=502, detail=str(error)) from error
     forecast_properties = forecast.get("properties")
-    if not isinstance(forecast_properties, dict):
+    periods = forecast_properties.get("periods") if isinstance(forecast_properties, dict) else None
+    if not isinstance(periods, list):
         raise HTTPException(
-            status_code=502, detail="The hourly forecast returned an unexpected response."
+            status_code=502,
+            detail="The hourly forecast returned an unexpected response.",
         )
-    periods = forecast_properties.get("periods")
-    if not isinstance(periods, list) or not periods:
-        raise HTTPException(status_code=502, detail="The hourly forecast is currently unavailable.")
-    today_periods = []
+
+    next_day = local_now + timedelta(hours=24)
+    wind_speeds: dict[str, list[float]] = {"daytime": [], "nighttime": []}
     for period in periods:
+        if not isinstance(period, dict) or not isinstance(period.get("isDaytime"), bool):
+            continue
         try:
-            start = datetime.fromisoformat(str(period["startTime"]))
+            start = datetime.fromisoformat(str(period["startTime"])).astimezone(zone)
         except (KeyError, TypeError, ValueError):
             continue
-        if start.astimezone(local_now.tzinfo).date() == local_now.date():
-            today_periods.append(period)
-    if not today_periods:
-        today_periods = periods[:12]
-    daytime = [
-        item for item in today_periods
-        if isinstance(item, dict) and item.get("isDaytime") is True
-    ]
-    nighttime = [
-        item for item in today_periods
-        if isinstance(item, dict) and item.get("isDaytime") is False
-    ]
-    if not daytime:
-        daytime = [
-            item for item in periods
-            if isinstance(item, dict) and item.get("isDaytime") is True
-        ][:8]
-    if not nighttime:
-        nighttime = [
-            item for item in periods
-            if isinstance(item, dict) and item.get("isDaytime") is False
-        ][:8]
-    current_period = next(
-        (item for item in periods if isinstance(item, dict)), {}
-    )
+        if start < local_now or start > next_day:
+            continue
+        category = "daytime" if period["isDaytime"] else "nighttime"
+        wind_values = re.findall(r"\d+(?:\.\d+)?", str(period.get("windSpeed", "")))
+        wind_speeds[category].extend(float(value) for value in wind_values)
 
-    def summarize(items: list[dict]) -> dict | None:
-        temperatures = [
-            item.get("temperature")
-            for item in items
-            if isinstance(item.get("temperature"), (int, float))
-        ]
-        precip = [
-            item.get("probabilityOfPrecipitation", {}).get("value")
-            for item in items
-            if isinstance(item.get("probabilityOfPrecipitation"), dict)
-            and isinstance(item["probabilityOfPrecipitation"].get("value"), (int, float))
-        ]
-        winds = []
-        for item in items:
-            match = re.search(r"\d+(?:\.\d+)?", str(item.get("windSpeed", "")))
-            if match:
-                winds.append(float(match.group()))
-        first = items[0] if items else {}
-        return {
-            "temperature_low_f": min(temperatures) if temperatures else None,
-            "temperature_high_f": max(temperatures) if temperatures else None,
-            "conditions": first.get("shortForecast"),
-            "wind": first.get("windSpeed"),
-            "wind_direction": first.get("windDirection"),
-            "maximum_precipitation_chance_percent": max(precip) if precip else None,
-            "maximum_wind_mph": max(winds) if winds else None,
-            "hours_forecast": len(items),
-        } if items else None
-
-    return (
-        {
-            "provider": "National Weather Service",
-            "forecast_date": local_now.date().isoformat(),
-            "local_time_zone": timezone_name,
-            "current_hour": {
-                "temperature_f": current_period.get("temperature"),
-                "conditions": current_period.get("shortForecast"),
-                "wind": current_period.get("windSpeed"),
-                "wind_direction": current_period.get("windDirection"),
-            },
-            "daytime": summarize(daytime),
-            "nighttime": summarize(nighttime),
-        },
-        timezone_name,
-        local_now,
-    )
+    wind = {
+        category: {
+            "maximum_wind_mph": max(values) if values else None,
+        }
+        for category, values in wind_speeds.items()
+    }
+    return timezone_name, local_now, wind
 
 
 def _parse_usgs_sites(text: str) -> list[dict]:
@@ -549,6 +438,121 @@ def _distance_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float
     delta_lambda = math.radians(lon2 - lon1)
     value = math.sin(delta_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
     return 2 * radius * math.asin(min(1, math.sqrt(value)))
+
+
+def _nearby_fishing_access(location: dict) -> dict:
+    latitude = location["latitude"]
+    longitude = location["longitude"]
+    radius_meters = 8000
+    radius_miles = radius_meters / 1609.344
+    query = (
+        "[out:json][timeout:12];("
+        f'nwr(around:{radius_meters},{latitude},{longitude})["leisure"="fishing"];'
+        f'nwr(around:{radius_meters},{latitude},{longitude})["sport"="fishing"];'
+        f'nwr(around:{radius_meters},{latitude},{longitude})["fishing"="yes"];'
+        f'nwr(around:{radius_meters},{latitude},{longitude})["amenity"="parking"];'
+        ");out center tags 80;"
+    )
+    try:
+        result = _external_json(
+            "https://overpass-api.de/api/interpreter?" + urlencode({"data": query}),
+            "OpenStreetMap",
+        )
+    except DataSourceError as error:
+        raise HTTPException(
+            status_code=502,
+            detail="Could not load mapped fishing spots and parking. Please try again later.",
+        ) from error
+
+    elements = result.get("elements")
+    if not isinstance(elements, list):
+        raise HTTPException(
+            status_code=502,
+            detail="Mapped fishing access returned an unexpected response.",
+        )
+
+    fishing_spots = []
+    parking = []
+    supported_access = {"public", "yes", "permissive", "permit"}
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        tags = element.get("tags")
+        if not isinstance(tags, dict):
+            continue
+        is_fishing = (
+            tags.get("leisure") == "fishing"
+            or tags.get("sport") == "fishing"
+            or tags.get("fishing") == "yes"
+        )
+        is_parking = tags.get("amenity") == "parking"
+        if not is_fishing and not is_parking:
+            continue
+        access = str(tags.get("access", "")).casefold()
+        if access not in supported_access:
+            continue
+
+        coordinates = element.get("center", element)
+        if not isinstance(coordinates, dict):
+            continue
+        try:
+            point_latitude = float(coordinates["lat"])
+            point_longitude = float(coordinates["lon"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        distance = _distance_miles(
+            latitude, longitude, point_latitude, point_longitude
+        )
+        if distance > radius_miles:
+            continue
+
+        if access == "public":
+            access_status = "Public access mapped"
+            access_rank = 0
+        elif access == "permissive":
+            access_status = "Public access permitted"
+            access_rank = 0
+        elif access == "yes":
+            access_status = "Access marked unrestricted"
+            access_rank = 0
+        elif access == "permit":
+            access_status = "Permit required"
+            access_rank = 1
+        else:
+            access_status = "Permit required"
+            access_rank = 1
+        point = {
+            "name": (
+                tags.get("name")
+                or tags.get("description")
+                or ("Fishing spot" if is_fishing else "Parking")
+            ),
+            "latitude": point_latitude,
+            "longitude": point_longitude,
+            "distance_miles": round(distance, 1),
+            "access_status": access_status,
+            "_access_rank": access_rank,
+        }
+        (fishing_spots if is_fishing else parking).append(point)
+
+    def nearest_first(points: list[dict]) -> list[dict]:
+        points.sort(
+            key=lambda point: (
+                point["_access_rank"],
+                point["distance_miles"],
+                point["name"].casefold(),
+            )
+        )
+        return [
+            {key: value for key, value in point.items() if key != "_access_rank"}
+            for point in points[:3]
+        ]
+
+    return {
+        "search_radius_miles": round(radius_miles, 1),
+        "fishing_spots": nearest_first(fishing_spots),
+        "parking": nearest_first(parking),
+    }
 
 
 def _water_temperature(center: dict) -> dict:
@@ -695,29 +699,33 @@ def _season_for(month: int) -> str:
     return "fall"
 
 
-def _behavior_context(
-    species: str, water_temperature_f: float | None, season: str
-) -> str:
-    if water_temperature_f is None:
-        return (
-            f"No recent water-temperature reading is available for {species}. "
-            f"The {season} calendar season is used only as a broad timing cue; "
-            "air temperature is not used as a substitute and no local fish activity is known."
-        )
-    if water_temperature_f < 48:
-        cue = "cold-water fish activity is often slower, so deliberate retrieves and pauses are a reasonable starting point"
-    elif water_temperature_f < 58:
-        cue = "cool-water fish may respond better to controlled retrieves and nearby cover or depth changes"
-    elif water_temperature_f < 68:
-        cue = "warming-water conditions support alternating a search lure with a slower follow-up"
-    elif water_temperature_f < 80:
-        cue = "warm-water fish may use shade, vegetation, and shallow-to-deep edges as conditions change"
-    else:
-        cue = "hot-water conditions make shade, cooler inflows, and deeper edges sensible places to check"
-    return (
-        f"For {species}, {cue}. This is a general temperature-based fishing heuristic, "
-        "not a verified behavior report for this waterbody; actual cover and fish location were not measured."
-    )
+def _lure_instruction(lure: str, species: str) -> str:
+    name = lure.casefold()
+    if "slip-sinker" in name:
+        return "Cast just beyond the nearest depth break; let the bait rest on bottom and keep the line slightly slack."
+    if "bobber" in name or "under a float" in name:
+        return "Cast beside visible brush or a weed edge; let the float settle and drift naturally, adjusting bait depth as needed."
+    if "jerkbait" in name or "minnow-style" in name or "minnow bait" in name:
+        return "Cast parallel to a rocky point or weed edge; retrieve with two twitches, pause, then repeat."
+    if "frog" in name or "topwater" in name or "buzzbait" in name:
+        return "Cast along the outside edge of shoreline vegetation; walk or buzz it steadily, pausing at open pockets."
+    if "spinnerbait" in name:
+        return "Cast across a shallow point or weed edge; retrieve steadily and slow briefly beside cover."
+    if "crankbait" in name:
+        return "Cast across a rocky bank or weed edge; retrieve steadily so it bumps cover, then pause."
+    if "spoon" in name or "blade bait" in name:
+        return "Cast across a point or current seam; retrieve with short lifts and let it flutter down between them."
+    if "swimbait" in name or "paddletail" in name or "swim jig" in name:
+        return "Cast parallel to a point or weed edge; swim it steadily just above the cover."
+    if "ned rig" in name or "tube jig" in name or "hair jig" in name or "jig" in name:
+        return "Cast to a rocky edge or visible cover; let it reach bottom, then drag or hop it slowly."
+    if "stick worm" in name or "worm" in name:
+        return "Cast beside shade or visible cover; let it sink, then lift it gently and pause."
+    if "spinner" in name:
+        return "Cast across a current seam or weed edge; retrieve just fast enough to keep the blade turning."
+    if species.casefold() == "catfish":
+        return "Cast beyond the nearest depth break; keep the bait on bottom and reel in slack without moving it."
+    return "Cast beside visible cover or a shoreline point; retrieve slowly with short pauses."
 
 
 def _recommend_lures(
@@ -748,14 +756,14 @@ def _recommend_lures(
 
     profiles = {
         "largemouth bass": {
-            "cold": ["Suspending jerkbait", "Compact jig and craw", "Small Colorado-blade spinnerbait"],
-            "cool": ["Suspending jerkbait", "Lipless crankbait", "Compact spinnerbait"],
-            "warming": ["Spinnerbait", "Ned rig", "Shallow crankbait"],
-            "warm": ["Walking topwater", "Swim jig", "Texas-rigged soft-plastic worm"],
-            "hot": ["Texas-rigged soft-plastic worm", "Compact jig and craw", "Hollow-body frog"],
-            "unknown": ["Spinnerbait", "Ned rig", "Texas-rigged soft-plastic worm"],
-            "night": ["Black Colorado-blade spinnerbait", "Dark jig and craw", "Buzzbait"],
-            "cold_night": ["Dark compact jig", "Slow-rolled Colorado-blade spinnerbait", "Suspending jerkbait"],
+            "cold": ["Suspending shad-pattern jerkbait", "Green-pumpkin Ned rig", "Black-and-blue jig with craw trailer"],
+            "cool": ["Suspending shad-pattern jerkbait", "White-and-chartreuse spinnerbait", "Green-pumpkin Ned rig"],
+            "warming": ["White spinnerbait", "Green-pumpkin Ned rig", "Shallow shad-pattern crankbait"],
+            "warm": ["Walking topwater bait", "White swim jig", "Green-pumpkin Texas-rigged worm"],
+            "hot": ["Green-pumpkin Texas-rigged worm", "Black-and-blue jig with craw trailer", "Hollow-body frog"],
+            "unknown": ["White spinnerbait", "Green-pumpkin Ned rig", "Green-pumpkin Texas-rigged worm"],
+            "night": ["Black Colorado-blade spinnerbait", "Black wacky-rigged stick worm", "Black buzzbait"],
+            "cold_night": ["Black-and-blue jig with craw trailer", "Black Colorado-blade spinnerbait", "Suspending shad-pattern jerkbait"],
         },
         "smallmouth bass": {
             "cold": ["Suspending jerkbait", "Hair jig", "Small tube jig"],
@@ -764,8 +772,8 @@ def _recommend_lures(
             "warm": ["Topwater walking bait", "Small swimbait", "Tube jig"],
             "hot": ["Ned rig", "Small tube jig", "Deep-diving crankbait"],
             "unknown": ["Suspending jerkbait", "Tube jig", "Ned rig"],
-            "night": ["Dark finesse jig", "Black spinnerbait", "Slow-swimming swimbait"],
-            "cold_night": ["Dark hair jig", "Small tube jig", "Slow suspending jerkbait"],
+            "night": ["Black 1/4-oz finesse jig with craw trailer", "Black 3/8-oz spinnerbait", "3-inch smoke paddletail on 1/8-oz jig head"],
+            "cold_night": ["Black hair jig", "Green-pumpkin 2.75-inch tube on 1/8-oz jig head", "Suspending shad-pattern jerkbait"],
         },
         "crappie": {
             "cold": ["1/16-oz marabou jig", "Small minnow under a slip bobber", "Tiny tube jig"],
@@ -784,7 +792,7 @@ def _recommend_lures(
             "warm": ["Jig and paddletail", "Shallow crankbait", "Night minnow-style jerkbait"],
             "hot": ["Jig and paddletail along a drop-off", "Deep-diving crankbait", "Night minnow-style jerkbait"],
             "unknown": ["Jig and minnow", "Suspending jerkbait", "Small paddletail"],
-            "night": ["Dark minnow-style jerkbait", "Jig and paddletail", "Slow-rolled spinnerbait"],
+            "night": ["Black-and-silver minnow jerkbait", "Jig with 3-inch paddletail", "Slow-rolled spinnerbait"],
             "cold_night": ["Jig and minnow", "Suspending jerkbait", "Slow blade bait"],
         },
         "northern pike": {
@@ -794,8 +802,8 @@ def _recommend_lures(
             "warm": ["Spinnerbait with wire leader", "Paddletail swimbait", "Topwater frog"],
             "hot": ["Paddletail swimbait", "Weedless spoon", "Spinnerbait along weed edge"],
             "unknown": ["Spinnerbait with wire leader", "Spoon", "Paddletail swimbait"],
-            "night": ["Black spinnerbait with wire leader", "Large dark swimbait", "Slow-rolled spoon"],
-            "cold_night": ["Slow spoon with wire leader", "Suspending jerkbait", "Slow spinnerbait"],
+            "night": ["Black 3/8-oz spinnerbait with wire leader", "Black 5-inch paddletail with wire leader", "1/2-oz spoon with wire leader"],
+            "cold_night": ["Slow 1/2-oz spoon with wire leader", "Suspending jerkbait with wire leader", "1/2-oz spinnerbait with wire leader"],
         },
         "catfish": {
             "cold": ["Cut bait on a slip-sinker rig", "Nightcrawler on a slip-sinker rig", "Small jig near bottom"],
@@ -814,7 +822,7 @@ def _recommend_lures(
             "warm": ["Small spoon in moving water", "Small inline spinner", "Jig under a float"],
             "hot": ["Small spoon in cooler inflow", "Small inline spinner", "Jig under a float"],
             "unknown": ["Small inline spinner", "Small spoon", "Jig under a float"],
-            "night": ["Small dark spoon", "Inline spinner", "Suspending minnow bait"],
+            "night": ["1/8-oz black spoon", "Small inline spinner", "Suspending minnow bait"],
             "cold_night": ["Small spoon", "Inline spinner", "Jig under a float"],
         },
     }
@@ -823,28 +831,16 @@ def _recommend_lures(
     day_lures = list(profile[temp_band])
     cold_water = (temp is not None and temp < 58) or (temp is None and season == "winter")
     night_lures = list(profile["cold_night"] if cold_water else profile["night"])
-
     daytime = weather.get("daytime") or {}
-    night_weather = weather.get("nighttime") or {}
     day_wind = daytime.get("maximum_wind_mph")
-    day_rain = daytime.get("maximum_precipitation_chance_percent")
-    night_wind = night_weather.get("maximum_wind_mph")
-    day_note = (
-        "Wind above 10 mph can make a moving, vibration-producing lure easier to find and cast from shore."
-        if isinstance(day_wind, (int, float)) and day_wind >= 10
-        else "With lighter forecast wind, cover water with a search bait, then slow down with a finesse option."
-    )
-    if isinstance(day_rain, (int, float)) and day_rain >= 50:
-        day_note += " Rain is forecast; check water clarity and avoid unsafe rising water."
     if isinstance(day_wind, (int, float)) and day_wind >= 10:
-        search_lure = next(
+        moving_lure = next(
             (
                 index
                 for index, lure in enumerate(day_lures)
                 if any(
                     keyword in lure.casefold()
                     for keyword in (
-                        "spinnerbait",
                         "spinner",
                         "crankbait",
                         "spoon",
@@ -856,43 +852,31 @@ def _recommend_lures(
             ),
             None,
         )
-        if search_lure is not None:
-            day_lures.insert(0, day_lures.pop(search_lure))
-    night_note = (
-        "A darker silhouette can be easier for fish to track against the night sky; keep retrieves controlled near shore."
-    )
-    if isinstance(night_wind, (int, float)) and night_wind >= 15:
-        night_note += " Forecast wind is strong; choose a protected bank or skip night casting if footing is unsafe."
-    if species.casefold() == "catfish":
-        day_lures = profile[temp_band]
-        night_lures = profile["night"] if not cold_water else profile["cold_night"]
-        day_note = "These are bait rigs rather than artificial lures; keep the rig simple for a shore setup."
-        night_note = "Use a secure rod holder, keep bait and hooks organized, and follow local night-fishing rules."
+        if moving_lure is not None:
+            day_lures.insert(0, day_lures.pop(moving_lure))
     if temp is None:
-        basis = (
-            f"No recent nearby water-temperature reading was available. Picks use {season} timing and "
-            "the forecast as context; air temperature is not treated as water temperature."
-        )
+        basis = f"Seasonal picks for {species}; no recent nearby water-temperature reading."
     else:
-        basis = f"Picks are keyed to the nearest recent measured water temperature ({temp:.1f}°F)."
+        basis = f"Picks for {species} using nearby water temperature ({temp:.1f}°F)."
     return {
         "species": species,
         "basis": basis,
         "day": [
-            {"rank": index + 1, "lure": lure, "why": basis + " " + day_note}
+            {
+                "rank": index + 1,
+                "lure": lure,
+                "how": _lure_instruction(lure, species),
+            }
             for index, lure in enumerate(day_lures)
         ],
         "night": [
-            {"rank": index + 1, "lure": lure, "why": basis + " " + night_note}
+            {
+                "rank": index + 1,
+                "lure": lure,
+                "how": _lure_instruction(lure, species),
+            }
             for index, lure in enumerate(night_lures)
         ],
-        "shore_tips": [
-            "Fan-cast from the bank, then work parallel to the shoreline; this keeps the lure in the near-shore strike zone longer.",
-            "Start with a natural forage color in clear water. If the water is stained, try a darker or higher-contrast color; actual visibility was not measured.",
-            "Look for accessible points, weed edges, riprap, inflows, docks, and windblown banks. These are suggestions to inspect, not features confirmed at this waterbody.",
-            "At night, use a headlamp, tell someone where you are, and avoid casting near other people.",
-        ],
-        "conditions_note": day_note,
     }
 
 
@@ -916,133 +900,26 @@ def build_recommendation_report(payload: RecommendationRequest) -> dict:
         "Largemouth Bass",
     )
     location = _resolve_named_waterbody(water_body, state)
-    weather, timezone_name, local_now = _nws_forecast(location)
-    water_temperature = _water_temperature(location)
-    if location["site"]:
-        water_temperature["waterbody_site"] = location["site"]
-    else:
-        water_temperature["waterbody_site"] = None
-        water_temperature["waterbody_site_message"] = (
-            "The waterbody location was identified from OpenStreetMap; USGS may or may not have "
-            "a temperature sensor at this exact water."
-        )
-    temp = water_temperature.get("temperature_f") if water_temperature.get("available") else None
+    timezone_name, local_now, weather = _local_time_and_wind(location)
+    reading = _water_temperature(location)
+    water_temperature = {"available": bool(reading.get("available"))}
+    if water_temperature["available"]:
+        water_temperature["temperature_f"] = reading["temperature_f"]
+        water_temperature["distance_miles"] = reading["distance_miles"]
+    temp = water_temperature.get("temperature_f")
     season = _season_for(local_now.month)
     moon = _moon_phase(local_now)
     recommendations = _recommend_lures(target_species, temp, season, weather)
-    if state == "OH":
-        state_source = {
-            "name": "Association of Fish & Wildlife Agencies member list",
-            "url": STATE_FISHING_SOURCES[state],
-            "description": (
-                "Use this directory to locate Ohio's state fish and wildlife agency; "
-                "verify current rules and advisories there."
-            ),
-        }
-    else:
-        state_source = {
-            "name": f"{STATES[state]} official fish and wildlife agency",
-            "url": STATE_FISHING_SOURCES[state],
-            "description": (
-                "Verify this water's current fishing regulations, access, advisories, "
-                "and local seasonal guidance."
-            ),
-        }
-    notes = [
-        "Lure picks are transparent seasonal/temperature heuristics, not an AI-generated catch guarantee or a live fish-activity report.",
-        "The behavior context is a general heuristic; NWS and USGS do not provide real-time fish activity or verified bite reports for this waterbody.",
-        "Water temperature is measured at the named waterbody only when a matching USGS site and recent sensor reading are available; otherwise the nearest recent USGS sensor is used and its distance is shown.",
-        "Weather comes from the National Weather Service forecast grid at the resolved waterbody coordinates; a forecast grid may not exactly match the bank you will fish.",
-        "Waterbody coordinates are resolved from a matching USGS site when possible, otherwise from OpenStreetMap results verified against the selected state. Ambiguous names are rejected instead of silently choosing a location.",
-        "The report cannot observe local water clarity, structure, access, fishing pressure, or current fish location. Treat each as a factor to verify at the bank.",
-        "Check the linked state agency for current seasons, size/bag limits, access rules, and any waterbody-specific advisories before fishing.",
-    ]
+    access = _nearby_fishing_access(location)
     return {
         "water_body": water_body,
         "state": {"code": state, "name": STATES[state]},
-        "location": location,
         "local_date": local_now.date().isoformat(),
         "season": season,
         "moon": moon,
-        "weather": weather,
-        "location_resolution": {
-            "place": location["place"],
-            "provider": location["provider"],
-            "reference": location["reference"],
-            "latitude": location["latitude"],
-            "longitude": location["longitude"],
-        },
         "water_temperature": water_temperature,
         "recommendations": recommendations,
-        "behavior_context": _behavior_context(target_species, temp, season),
-        "decision_factors": [
-            {
-                "factor": "Water temperature",
-                "use": (
-                    "Primary lure-selection signal when a recent USGS reading is available."
-                    if temp is not None
-                    else "Unavailable; the report does not substitute air temperature."
-                ),
-            },
-            {
-                "factor": "Season and target fish",
-                "use": (
-                    "Used for the fallback seasonal pattern when water temperature is unavailable; "
-                    "the selected fish determines the lure profiles."
-                ),
-            },
-            {
-                "factor": "Weather",
-                "use": (
-                    "Wind can move a shore-search lure higher in the daytime list; precipitation "
-                    "and wind add safety/clarity cautions."
-                ),
-            },
-            {
-                "factor": "Moon phase",
-                "use": (
-                    "Shown as local context, but not used to rank lures because it does not establish "
-                    "a reliable bite prediction for this specific water."
-                ),
-            },
-            {
-                "factor": "State",
-                "use": (
-                    "Links to the state fish and wildlife agency for current rules and advisories; "
-                    "the report does not infer a season or regulation for an unverified waterbody."
-                ),
-            },
-        ],
-        "data_notes": notes,
-        "sources": [
-            {
-                "name": "National Weather Service hourly forecast",
-                "url": "https://www.weather.gov/documentation/services-web-api",
-                "description": "Government forecast and weather conditions near the resolved waterbody coordinates.",
-            },
-            {
-                "name": "USGS measured water temperature",
-                "url": water_temperature.get("source", "https://waterdata.usgs.gov/"),
-                "description": "Recent temperature readings and monitoring-site details; a nearby sensor may differ from the fishing water.",
-            },
-            state_source,
-            {
-                "name": "Waterbody location",
-                "url": (
-                    "https://waterdata.usgs.gov/"
-                    if location["provider"] == "USGS"
-                    else "https://www.openstreetmap.org/copyright"
-                ),
-                "description": (
-                    f"Location resolved by {location['provider']}: {location['place']}. "
-                    + (
-                        "© OpenStreetMap contributors."
-                        if location["provider"] == "OpenStreetMap"
-                        else ""
-                    )
-                ),
-            },
-        ],
+        "access": access,
         "timezone": timezone_name,
         "generated_at": local_now.isoformat(),
     }

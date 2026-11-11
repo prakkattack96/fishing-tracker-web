@@ -613,29 +613,24 @@ function renderRecommendationReport(report) {
   container.replaceChildren();
   container.hidden = false;
 
-  const heading = reportElement(
-    "h2",
-    "",
-    `${report.water_body} · ${report.state.name} · ${report.local_date}`
-  );
-  const intro = reportElement(
-    "p",
-    "muted",
-    `Shore-casting guide for ${report.recommendations.species}. ${report.season[0].toUpperCase()}${report.season.slice(1)} season.`
-  );
+  const heading = reportElement("h2", "", `${report.water_body} · ${report.state.name}`);
+  const water = report.water_temperature;
+  const introText = water.available
+    ? `${report.recommendations.species} · ${water.temperature_f}°F nearby water reading · ${report.season}`
+    : `${report.recommendations.species} · seasonal picks · ${report.season}`;
+  const intro = reportElement("p", "muted", introText);
   const overview = reportElement("section", "panel recommendation-overview");
   overview.append(heading, intro);
 
-  const water = report.water_temperature;
-  const waterText = water.available
-    ? `${water.temperature_f}°F · ${water.station_name || water.site_id} · ${water.distance_miles} mi from ${water.distance_reference}`
-    : water.message;
   const overviewGrid = reportElement("div", "report-facts");
   const facts = [
-    ["Water temperature", waterText],
-    ["Moon", `${report.moon.phase} · ${report.moon.illumination_percent}% illumination`],
-    ["Waterbody location", `${report.location_resolution.place} · located with ${report.location_resolution.provider}`],
-    ["Forecast date", `${report.weather.forecast_date} · ${report.weather.local_time_zone}`]
+    [
+      "Water temperature",
+      water.available
+        ? `${water.temperature_f}°F · sensor ${water.distance_miles} mi away`
+        : "No recent nearby reading"
+    ],
+    ["Moon", report.moon.phase]
   ];
   for (const [label, value] of facts) {
     const fact = reportElement("article", "report-fact");
@@ -643,44 +638,6 @@ function renderRecommendationReport(report) {
     overviewGrid.append(fact);
   }
   overview.append(overviewGrid);
-  overview.append(reportElement("p", "muted small report-caveat", water.message));
-  if (water.waterbody_site_message) {
-    overview.append(reportElement("p", "muted small report-caveat", water.waterbody_site_message));
-  }
-
-  const weather = report.weather;
-  const forecast = reportElement("section", "panel report-weather");
-  forecast.append(reportElement("h3", "", "Local weather forecast"));
-  const weatherGrid = reportElement("div", "report-facts");
-  for (const [label, period] of [["Daytime", weather.daytime], ["Nighttime", weather.nighttime]]) {
-    const description = period
-      ? `${period.conditions || "Conditions unavailable"} · ${
-          period.temperature_low_f === null || period.temperature_high_f === null
-            ? "temperature unavailable"
-            : `${period.temperature_low_f}–${period.temperature_high_f}°F`
-        } · wind ${period.wind || "unavailable"}`
-      : "Forecast unavailable for this period.";
-    const item = reportElement("article", "report-fact");
-    item.append(reportElement("strong", "", label), reportElement("span", "", description));
-    if (period?.maximum_precipitation_chance_percent !== null && period?.maximum_precipitation_chance_percent !== undefined) {
-      item.append(reportElement("small", "muted", `Max precipitation chance: ${period.maximum_precipitation_chance_percent}%`));
-    }
-    weatherGrid.append(item);
-  }
-  forecast.append(weatherGrid);
-
-  const context = reportElement("section", "panel report-tactics");
-  context.append(
-    reportElement("h3", "", "Fish behavior and decision factors"),
-    reportElement("p", "muted behavior-context", report.behavior_context)
-  );
-  const factorList = document.createElement("ul");
-  for (const factor of report.decision_factors) {
-    factorList.append(
-      reportElement("li", "", `${factor.factor}: ${factor.use}`)
-    );
-  }
-  context.append(factorList);
 
   const lureGrid = reportElement("div", "lure-recommendation-grid");
   for (const [periodName, picks] of [["Day picks", report.recommendations.day], ["Night picks", report.recommendations.night]]) {
@@ -690,41 +647,65 @@ function renderRecommendationReport(report) {
     list.className = "lure-picks";
     for (const pick of picks) {
       const item = document.createElement("li");
-      item.append(reportElement("strong", "", pick.lure), reportElement("p", "muted", pick.why));
+      item.append(reportElement("strong", "", pick.lure), reportElement("p", "muted", pick.how));
       list.append(item);
     }
     panel.append(list);
     lureGrid.append(panel);
   }
 
-  const tactics = reportElement("section", "panel report-tactics");
-  tactics.append(reportElement("h3", "", "Shore-casting notes"));
-  const tacticsList = document.createElement("ul");
-  for (const tip of report.recommendations.shore_tips) {
-    tacticsList.append(reportElement("li", "", tip));
+  const access = reportElement("section", "panel report-access");
+  access.append(
+    reportElement("h3", "", "Nearby fishing spots & parking"),
+    reportElement("p", "muted small", "Mapped public or permit-required locations within 5 miles. Follow posted access and parking restrictions.")
+  );
+  const googleMapsUrl = (point) =>
+    `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${point.latitude},${point.longitude}`)}`;
+  for (const [label, points] of [
+    ["Fishing spots", report.access.fishing_spots],
+    ["Parking", report.access.parking]
+  ]) {
+    access.append(reportElement("h4", "", label));
+    if (!points.length) {
+      access.append(reportElement("p", "muted small", `No nearby ${label.toLowerCase()} are mapped.`));
+      continue;
+    }
+    const list = document.createElement("ul");
+    list.className = "access-list";
+    for (const point of points) {
+      const item = document.createElement("li");
+      const details = reportElement(
+        "span",
+        "access-details",
+        `${point.name} · ${point.distance_miles} mi · ${point.access_status}`
+      );
+      const link = document.createElement("a");
+      link.href = googleMapsUrl(point);
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+      link.textContent = "Open in Google Maps";
+      item.append(details, link);
+      list.append(item);
+    }
+    access.append(list);
   }
-  tactics.append(tacticsList);
+  const broaderSearch = document.createElement("a");
+  broaderSearch.href = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`public fishing access near ${report.water_body}, ${report.state.name}`)}`;
+  broaderSearch.target = "_blank";
+  broaderSearch.rel = "noopener noreferrer";
+  broaderSearch.textContent = "Explore public fishing access in Google Maps";
+  access.append(broaderSearch);
+  const attribution = document.createElement("small");
+  attribution.className = "map-attribution";
+  const attributionLink = document.createElement("a");
+  attributionLink.href = "https://www.openstreetmap.org/copyright";
+  attributionLink.target = "_blank";
+  attributionLink.rel = "noopener noreferrer";
+  attributionLink.textContent = "© OpenStreetMap contributors";
+  attribution.append("Map data ", attributionLink);
+  access.append(attribution);
 
-  const sources = reportElement("section", "panel report-sources");
-  sources.append(reportElement("h3", "", "Sources and what to verify"));
-  const sourceList = document.createElement("ul");
-  for (const source of report.sources) {
-    const item = document.createElement("li");
-    const link = document.createElement("a");
-    link.href = source.url;
-    link.target = "_blank";
-    link.rel = "noopener noreferrer";
-    link.textContent = source.name;
-    item.append(link, reportElement("span", "muted", ` — ${source.description}`));
-    sourceList.append(item);
-  }
-  sources.append(sourceList);
-  const limitations = document.createElement("ul");
-  limitations.className = "report-limitations";
-  for (const note of report.data_notes) limitations.append(reportElement("li", "", note));
-  sources.append(limitations);
-
-  container.append(overview, forecast, context, lureGrid, tactics, sources);
+  container.append(overview, lureGrid, access);
 }
 
 async function submitRecommendation(event) {
@@ -734,8 +715,8 @@ async function submitRecommendation(event) {
   const button = $("#recommendation-submit");
   const message = $("#recommendation-message");
   button.disabled = true;
-  button.textContent = "Gathering local conditions…";
-  setMessage(message, "Locating the waterbody and checking the local forecast and USGS measurements. This may take a few seconds.");
+  button.textContent = "Building your guide…";
+  setMessage(message, "Finding the waterbody, water temperature, and nearby mapped access.");
   try {
     const report = await fetchJson(`${(CONFIG.apiBaseUrl || "").replace(/\/$/, "")}/api/recommendations`, {
       method: "POST",
@@ -747,7 +728,7 @@ async function submitRecommendation(event) {
       })
     });
     renderRecommendationReport(report);
-    setMessage(message, "Report ready. Conditions and readings may change; verify before heading out.");
+    setMessage(message, "Fishing guide ready.");
   } catch (error) {
     setMessage(message, `Could not build the report: ${error.message}`, true);
   } finally {

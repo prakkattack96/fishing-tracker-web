@@ -4,37 +4,34 @@
 
 The **Shore lure guide** tab creates separate day and night lure lists for a
 named waterbody, state, and optional target fish. No ZIP code is needed.
-Leaving the fish blank gives bass-first suggestions. The report uses:
+Leaving the fish blank gives bass-first suggestions. It uses:
 
 - A matching USGS site, or OpenStreetMap geocoding when a matching USGS site
   cannot be found, to locate the named waterbody within the selected state.
-- The National Weather Service API for an hourly forecast near the resolved
-  waterbody coordinates.
-- USGS Water Data for recent water-temperature readings and named lake/stream
-  monitoring sites when available.
-- The current local calendar season and a calculated moon phase.
-- Explicit, deterministic seasonal/temperature lure heuristics, plus
-  shore-casting tactics and links to the selected state's fish and wildlife
-  agency (or an agency directory when a direct page could not be verified).
+- USGS Water Data for a recent nearby water-temperature reading when available.
+- The National Weather Service hourly forecast to determine local time and
+  wind influence on lure ranking. Forecast details are not shown in the report.
+- OpenStreetMap map features tagged for fishing and parking within about five
+  miles, ranked by mapped access status and distance. Each result links to its
+  coordinates in Google Maps. Locations are included only when map tags mark
+  access as public/unrestricted or permit-required; unknown and restricted
+  access is not recommended.
+- Seasonal and water-temperature lure profiles, with a short cast-and-retrieve
+  instruction for each pick.
 
-This report is not live fish telemetry, local catch data, or a guaranteed
-recommendation. USGS may have no recent sensor near the fishing spot; in that
-case the report says so and never substitutes air temperature for water
-temperature. When only a nearby sensor is available, the report shows its
-station, reading time, and distance. A failed data provider is reported rather
-than silently presented as a successful measurement. The weather forecast uses
-the resolved waterbody's forecast grid and may not exactly represent a specific bank.
-Ambiguous or unverified locations are rejected rather than silently selecting
-the wrong waterbody.
-Water clarity, access, structure, forage, fishing pressure, and current fish
-location are not observed. Use the linked state-agency source to check current
-regulations, advisories, access, and seasonal guidance for the specific water.
+The lure profiles are general seasonal/temperature guidance, not a live scrape
+of fishing reports, local catch data, or a guarantee. Map listings are
+OpenStreetMap features and may be incomplete or out of date; map tags do not
+guarantee on-site conditions. The report labels permit-required locations and
+does not suggest locations whose access status is unknown or restricted. Follow posted access and parking restrictions. The report
+does not claim to search every online source or verify current on-site
+conditions. Ambiguous waterbody names are rejected rather than silently
+selecting the wrong location.
 
 The recommendation endpoint uses free public services and does not require the
 OpenAI key or a signed-in catch account. It does require the server to have
-internet access to OpenStreetMap, National Weather Service, and USGS services.
-OpenStreetMap is used as the named-waterbody geocoder when USGS does not return
-a confident matching site; its results are attributed in the report.
+internet access to OpenStreetMap, Overpass, National Weather Service, and USGS.
+OpenStreetMap map data is attributed in the access section.
 
 This is the phone-friendly, installable web app with a Supabase-backed catch
 log. The Tkinter desktop app is a separate client for now and has not been
