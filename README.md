@@ -15,25 +15,82 @@ It uses:
   fishing access.
 - USGS Water Data for a recent nearby water-temperature reading when available.
 - The nearest available National Weather Service station's latest wind
-  observation, including its age and direction. The hourly forecast still
-  informs lure ranking; the report displays the current station observation.
+  observation, including its age and direction. The hourly forecast informs
+  day/night lure ranking using wind, cloud cover, precipitation probability,
+  and air-temperature changes; those forecasts are not displayed as local
+  fishing facts.
 - A satellite map from Esri, a state waterbody outline when available, and
   official Massachusetts or New Hampshire bathymetric contours when available.
   New Hampshire contour metadata specifies feet; the Massachusetts service
   does not specify the depth unit in its layer metadata.
-- Seasonal and water-temperature lure profiles with waterbody-specific
-  day/night picks and short shore-casting instructions.
+- Seasonal and nearby-water-temperature lure profiles with specific sizes,
+  rigging, retrieval, shore habitat, rationale, and a backup presentation.
+- Public shoreline-access pins only when the state or OpenStreetMap record
+  explicitly identifies shore or fishing-pier access and the point is close to
+  the matched shoreline. Other pins are approximate shoreline sections, not
+  access claims.
 
-Lure picks are rule-based seasonal, temperature, species, and habitat guidance,
-not a live scrape of fishing reports or local catch data and not a guarantee.
-Wind direction is used as a cautious search-side heuristic: wind can move
-surface water and floating forage, but does not establish where bass or baitfish
-are holding. River current seams and eddies take priority on moving water.
-Numbered shoreline pins show approximate places to begin casting, not verified
-hotspots, safe paths, or public access. Waterbody boundaries and contour
-coverage are incomplete; check ownership, posted rules, weather, and conditions
-before fishing. Ambiguous waterbody names are rejected rather than silently
-selecting the wrong location.
+Lure picks are rules, not a guarantee or a substitute for a waterbody-specific
+fish survey. A dated regional report can influence picks only for an exact
+waterbody/species match, and that snapshot expires after 14 days. The report
+snapshot is not automatically refreshed. Wind is a cautious search-side
+heuristic: it may move surface water and floating forage, but does not establish
+where fish are holding. River current seams take priority on moving water.
+Where access cannot be confirmed, map pins show approximate shoreline places to
+begin looking, not proven hotspots, safe paths, or permission to enter. USGS
+water temperature is the nearest recent sensor within 75 miles, not a
+measurement at the selected fishing spot. Forage, water clarity, submerged
+vegetation, substrate, local species occurrence, and current access conditions
+are not consistently available and are not invented. Ambiguous waterbody names
+are rejected rather than silently selecting the wrong location.
+
+### Research sources
+
+Sources below were reviewed on **November 11, 2026**. Recent reports are
+anecdotal and were used only when they named a waterbody and species; they do
+not override seasonal guidance outside the short expiry window. Manufacturer
+and tournament-angler material informs presentation technique, not fish
+occurrence or guaranteed catch rates.
+
+- MassWildlife, [freshwater fishing](https://www.mass.gov/freshwater-fishing)
+  and [2026 trout stocking report](https://www.mass.gov/info-details/trout-stocking-report):
+  state fishery context, stocking species, waters, and dates.
+- Massachusetts, [saltwater public-access information](https://www.mass.gov/info-details/saltwater-fishing-public-access):
+  the Office of Fishing and Boating Access distinguishes ramps, piers, and
+  shore-side fishing areas. The app promotes only pins whose access type is
+  explicit in its underlying record.
+- NOAA, [New England/Mid-Atlantic fisheries](https://www.fisheries.noaa.gov/region/new-england-mid-atlantic),
+  [tides and currents](https://tidesandcurrents.noaa.gov/), and
+  [Public Access Fishing Site Register](https://www.st.nmfs.noaa.gov/recreational-fisheries/access-data/public-access-fishing-site-register/index):
+  regional marine-management context, official coastal conditions, and
+  access-site categories.
+- USGS, [Water Data](https://waterdata.usgs.gov/nwis): source for nearby
+  measured water-temperature readings. Sensor distance and freshness remain
+  important limitations.
+- On The Water, [Massachusetts Fishing Report, November 5, 2026](https://onthewater.com/fishing-reports/2026/11/massachusetts-fishing-report-november-5-2026):
+  exact-water reports included shallow pike catches at Lake Quinsigamond,
+  Indian Lake, and Flint Pond (spinnerbaits, inline spinners, and shiners), and
+  green dough bait for trout at Pratt's Pond. These matching cases are recorded
+  in `server.py` and stop influencing picks after 14 days.
+- On The Water, [Cape Cod Fishing Report, November 5, 2026](https://onthewater.com/fishing-reports/2026/11/cape-cod-fishing-report-november-5-2026):
+  checked as regional seasonal context; its broad observations are not applied
+  to unrelated ponds or asserted as current catch data.
+- Bassmaster, [Land of Giants: Early Fall Transition](https://www.bassmaster.com/elite/news/land-of-giants-early-fall-transition/)
+  and [Northern Fishing Best in the Fall](https://www.bassmaster.com/column/easton-fothergill/northern-fishing-best-in-the-fall/):
+  experienced-angler context on seasonal transitions, forage, location
+  uncertainty, and fall presentations.
+- Berkley, [bass spawn overview](https://www.berkley-fishing.com/blogs/news/everything-you-need-to-know-about-the-spawn-but-were-afraid-to-ask)
+  and [Power vs. Finesse](https://www.berkley-fishing.com/blogs/news/power-vs-finesse):
+  technique and seasonal behavior cross-checks. Manufacturer advice is treated
+  as technique guidance, not neutral evidence.
+- Wind/habitat research already used by the location heuristic:
+  [Limnology and Oceanography (2010)](https://doi.org/10.4319/lo.2010.55.4.1590)
+  and [Limnology and Oceanography (2005)](https://doi.org/10.4319/lo.2005.50.2.0465).
+  These studies do not identify a specific bass hotspot.
+
+The current form covers freshwater target species only; it has no saltwater
+target-species or tide-stage selector. Marine recommendations and tide-aware
+lure ranking therefore remain out of scope rather than being guessed.
 
 The wind heuristic is intentionally limited. Field research has documented
 wind-related patchiness in planktonic predator-prey overlap

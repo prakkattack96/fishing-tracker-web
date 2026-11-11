@@ -1,5 +1,5 @@
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
@@ -52,7 +52,7 @@ class RecommendationTests(unittest.TestCase):
             patch.object(
                 server,
                 "_nearby_fishing_access",
-                side_effect=AssertionError("The recommendation report should not query access lists."),
+                return_value={"shore_access": [], "fishing_spots": [], "parking": []},
             ),
         ):
             report = server.build_recommendation_report(
@@ -77,7 +77,7 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(report["water_type"], "lake")
         self.assertEqual(
             report["recommendations"]["day"][0]["lure"],
-            "3/8-oz suspending shad-pattern jerkbait",
+            "3.5- to 4-inch 3/8-oz suspending shad-pattern jerkbait",
         )
         self.assertNotIn("weather", report)
         self.assertNotIn("sources", report)
@@ -313,7 +313,7 @@ class RecommendationTests(unittest.TestCase):
         self.assertIn("Seasonal picks", winter["basis"])
         self.assertEqual(
             winter["night"][0]["lure"],
-            "Black-and-blue jig with craw trailer",
+            "1/8-oz Black-and-blue jig with craw trailer",
         )
         self.assertIn("Cast", winter["day"][0]["how"])
         self.assertIn("retrieve", winter["day"][0]["how"])
@@ -323,7 +323,10 @@ class RecommendationTests(unittest.TestCase):
         same_conditions = server._recommend_lures("Largemouth Bass", 44, "winter", {})
 
         self.assertEqual(winter, same_conditions)
-        self.assertEqual(winter["day"][0]["lure"], "Suspending shad-pattern jerkbait")
+        self.assertEqual(
+            winter["day"][0]["lure"],
+            "3.5- to 4-inch, 3/8-oz Suspending shad-pattern jerkbait",
+        )
 
     def test_waterbody_type_changes_shore_lures_and_casting_instructions(self):
         pond = server._recommend_lures("Largemouth Bass", 70, "summer", {}, "pond")
@@ -332,7 +335,10 @@ class RecommendationTests(unittest.TestCase):
         )
         river = server._recommend_lures("Largemouth Bass", 70, "summer", {}, "river")
 
-        self.assertEqual(pond["day"][0]["lure"], "4-inch green-pumpkin wacky-rigged stick worm")
+        self.assertEqual(
+            pond["day"][0]["lure"],
+            "4-inch green-pumpkin wacky-rigged stick worm (weightless, 1/0 hook)",
+        )
         self.assertEqual(reservoir["day"][0]["lure"], "3/8-oz white-and-chartreuse spinnerbait")
         self.assertEqual(river["day"][0]["lure"], "3/8-oz white spinnerbait")
         self.assertNotEqual(pond["day"][0]["lure"], reservoir["day"][0]["lure"])
@@ -345,8 +351,14 @@ class RecommendationTests(unittest.TestCase):
         pond = server._recommend_lures("Largemouth Bass", 44, "winter", {}, "pond")
         lake = server._recommend_lures("Largemouth Bass", 44, "winter", {}, "lake")
 
-        self.assertEqual(pond["day"][0]["lure"], "1/8-oz green-pumpkin Ned rig")
-        self.assertEqual(lake["day"][0]["lure"], "3/8-oz suspending shad-pattern jerkbait")
+        self.assertEqual(
+            pond["day"][0]["lure"],
+            "3-inch 1/8-oz green-pumpkin Ned rig",
+        )
+        self.assertEqual(
+            lake["day"][0]["lure"],
+            "3.5- to 4-inch 3/8-oz suspending shad-pattern jerkbait",
+        )
 
     def test_local_weather_is_reduced_to_day_and_night_wind_signals(self):
         zone = ZoneInfo("America/New_York")
@@ -364,11 +376,25 @@ class RecommendationTests(unittest.TestCase):
                         "startTime": (now + timedelta(hours=1)).isoformat(),
                         "isDaytime": True,
                         "windSpeed": "10 to 15 mph",
+                        "temperature": 65,
+                        "skyCover": {"value": 70},
+                        "probabilityOfPrecipitation": {"value": 20},
+                    },
+                    {
+                        "startTime": (now + timedelta(hours=2)).isoformat(),
+                        "isDaytime": True,
+                        "windSpeed": "10 mph",
+                        "temperature": 60,
+                        "skyCover": {"value": 80},
+                        "probabilityOfPrecipitation": {"value": 60},
                     },
                     {
                         "startTime": (now + timedelta(hours=13)).isoformat(),
                         "isDaytime": False,
                         "windSpeed": "5 mph",
+                        "temperature": 50,
+                        "skyCover": {"value": 40},
+                        "probabilityOfPrecipitation": {"value": 10},
                     },
                 ]
             }
@@ -382,6 +408,12 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(local_now.tzinfo, zone)
         self.assertEqual(wind["daytime"]["maximum_wind_mph"], 15)
         self.assertEqual(wind["nighttime"]["maximum_wind_mph"], 5)
+        self.assertEqual(wind["daytime"]["average_air_temperature_f"], 62.5)
+        self.assertEqual(wind["daytime"]["average_cloud_cover_percent"], 75)
+        self.assertEqual(
+            wind["daytime"]["maximum_precipitation_probability_percent"], 60
+        )
+        self.assertEqual(wind["daytime"]["temperature_change_f"], -5)
 
     def test_current_station_wind_uses_nearest_fresh_observation(self):
         zone = ZoneInfo("America/New_York")
@@ -507,9 +539,144 @@ class RecommendationTests(unittest.TestCase):
             "Largemouth Bass", 55, "winter", {"daytime": {"maximum_wind_mph": 12}}
         )
 
-        self.assertEqual(windy["day"][0]["lure"], "White-and-chartreuse spinnerbait")
-        self.assertEqual(calm["day"][0]["lure"], "Suspending shad-pattern jerkbait")
+        self.assertEqual(
+            windy["day"][0]["lure"],
+            "3/8-oz White-and-chartreuse spinnerbait",
+        )
+        self.assertEqual(
+            calm["day"][0]["lure"],
+            "3.5- to 4-inch, 3/8-oz Suspending shad-pattern jerkbait",
+        )
         self.assertNotIn("weather", windy)
+
+    def test_cloud_rain_and_cold_front_change_lure_order_without_overriding_water_temp(self):
+        baseline = server._recommend_lures("Walleye", 45, "winter", {})
+        low_light = server._recommend_lures(
+            "Walleye",
+            45,
+            "winter",
+            {
+                "daytime": {
+                    "average_cloud_cover_percent": 80,
+                    "maximum_precipitation_probability_percent": 60,
+                }
+            },
+        )
+        cold_front = server._recommend_lures(
+            "Largemouth Bass",
+            55,
+            "fall",
+            {"daytime": {"temperature_change_f": -8}},
+        )
+
+        self.assertNotEqual(baseline["day"][0]["lure"], low_light["day"][0]["lure"])
+        self.assertIn("clouds or rain", low_light["day"][0]["how"])
+        self.assertIn("Ned rig", cold_front["day"][0]["lure"])
+        self.assertIn("Cool nearby water", cold_front["day"][0]["how"])
+
+    def test_picks_are_specific_and_include_a_condition_change_backup_for_each_species(self):
+        for species in (
+            "Largemouth Bass",
+            "Smallmouth Bass",
+            "Crappie",
+            "Walleye",
+            "Northern Pike",
+            "Catfish",
+            "Trout",
+        ):
+            with self.subTest(species=species):
+                result = server._recommend_lures(species, 61, "fall", {}, "pond")
+                for period in ("day", "night"):
+                    self.assertEqual(len(result[period]), 3)
+                    for pick in result[period]:
+                        self.assertTrue(pick["lure"])
+                        self.assertTrue(pick["backup"])
+                        self.assertIn("Cast", pick["how"])
+                        self.assertIn("Backup:", pick["how"])
+                        self.assertIn("retrieve", pick["how"].casefold())
+                        self.assertRegex(pick["lure"], r"\d")
+                self.assertEqual(
+                    len(
+                        {
+                            server._lure_identity(pick["lure"])
+                            for pick in result["day"]
+                        }
+                    ),
+                    3,
+                )
+
+    def test_exact_recent_local_reports_influence_only_matching_water_and_species(self):
+        current = server._recommend_lures(
+            "Northern Pike",
+            50,
+            "fall",
+            {},
+            "lake",
+            "MA",
+            "Lake Quinsigamond, Worcester",
+            date(2026, 11, 11),
+        )
+        expired = server._recommend_lures(
+            "Northern Pike",
+            50,
+            "fall",
+            {},
+            "lake",
+            "MA",
+            "Lake Quinsigamond",
+            date(2026, 11, 20),
+        )
+        wrong_species = server._recommend_lures(
+            "Largemouth Bass",
+            50,
+            "fall",
+            {},
+            "lake",
+            "MA",
+            "Lake Quinsigamond",
+            date(2026, 11, 11),
+        )
+
+        self.assertIn("dated 2026-11-05", current["basis"])
+        self.assertIn("spinnerbait", current["day"][0]["lure"].casefold())
+        self.assertNotIn("Exact-waterbody report", expired["basis"])
+        self.assertNotIn("Exact-waterbody report", wrong_species["basis"])
+
+    def test_verified_shore_access_ranks_above_unverified_shoreline_sections(self):
+        ring = [
+            [-71.01, 42.01],
+            [-70.99, 42.01],
+            [-70.99, 41.99],
+            [-71.01, 41.99],
+            [-71.01, 42.01],
+        ]
+        spots = server._shoreline_spots(
+            ring,
+            {"current": {"available": False}},
+            access_spots=[
+                {
+                    "name": "Public fishing pier",
+                    "latitude": 42.0,
+                    "longitude": -71.01,
+                    "access_type": "Fishing pier",
+                    "access_status": "Public access mapped",
+                    "source": "OpenStreetMap",
+                },
+                {
+                    "name": "Distant pier",
+                    "latitude": 42.03,
+                    "longitude": -71.01,
+                    "access_type": "Fishing pier",
+                    "source": "OpenStreetMap",
+                },
+            ],
+        )
+
+        self.assertEqual(spots[0]["label"], "Fishing pier · Public fishing pier")
+        self.assertEqual(spots[0]["access_type"], "Fishing pier")
+        self.assertNotIn("Distant pier", str(spots))
+        self.assertIn("Unverified shoreline section", spots[1]["access_type"])
+        self.assertIn("Public shore access is not verified", spots[1]["reason"])
 
     def test_nearby_access_lists_only_mapped_features_and_ranks_public_access(self):
         response = {
@@ -526,7 +693,12 @@ class RecommendationTests(unittest.TestCase):
                     "id": 2,
                     "lat": 40.38,
                     "lon": -74.66,
-                    "tags": {"leisure": "fishing", "name": "Public pier", "access": "public"},
+                    "tags": {
+                        "leisure": "fishing",
+                        "man_made": "pier",
+                        "name": "Public pier",
+                        "access": "public",
+                    },
                 },
                 {
                     "type": "way",
@@ -549,6 +721,7 @@ class RecommendationTests(unittest.TestCase):
             )
 
         self.assertEqual([spot["name"] for spot in access["fishing_spots"]], ["Public pier"])
+        self.assertEqual(access["shore_access"][0]["access_type"], "Fishing pier")
         self.assertEqual(access["parking"][0]["name"], "Lake lot")
         self.assertEqual(access["parking"][0]["access_status"], "Public access mapped")
 
@@ -576,9 +749,46 @@ class RecommendationTests(unittest.TestCase):
             )
 
         self.assertEqual(access["fishing_spots"][0]["name"], "Arlington Reservoir")
+        self.assertEqual(access["shore_access"], [])
         self.assertEqual(access["parking"][0]["access_status"], "State fishing access")
         self.assertIn("MassGIS", access["attribution"])
         self.assertIn("OpenStreetMap", access["attribution"])
+
+    def test_openstreetmap_access_is_used_when_state_access_lookup_fails(self):
+        response = {
+            "elements": [
+                {
+                    "type": "node",
+                    "id": 9,
+                    "lat": 42.4291,
+                    "lon": -71.1894,
+                    "tags": {
+                        "leisure": "fishing",
+                        "man_made": "pier",
+                        "access": "public",
+                        "name": "Mapped public pier",
+                    },
+                }
+            ]
+        }
+        with (
+            patch.object(
+                server,
+                "_arcgis_nearby_features",
+                side_effect=server.DataSourceError("MassGIS", "service unavailable"),
+            ),
+            patch.object(server, "_external_json", return_value=response),
+        ):
+            access = server._nearby_fishing_access(
+                {"latitude": 42.4291, "longitude": -71.1894}, "MA"
+            )
+
+        self.assertEqual(access["fishing_spots"][0]["name"], "Mapped public pier")
+        self.assertEqual(access["shore_access"][0]["access_type"], "Fishing pier")
+        self.assertIn(
+            "Massachusetts public fishing-access data is unavailable",
+            access["message"],
+        )
 
     def test_usgs_rdb_site_parser_skips_type_row(self):
         text = (

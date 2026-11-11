@@ -669,6 +669,9 @@ function renderRecommendationMap(report) {
   if (mapData.bathymetry?.source_url) {
     sources.push([mapData.bathymetry.source, mapData.bathymetry.source_url]);
   }
+  for (const source of mapData.access_sources || []) {
+    sources.push([source.name, source.url]);
+  }
   sources.forEach(([label, href], index) => {
     if (index) attribution.append(" · ");
     const link = document.createElement("a");

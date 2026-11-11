@@ -10,9 +10,9 @@ import os
 import re
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 from urllib.parse import urlencode
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -48,6 +48,56 @@ RECOMMENDATION_SPECIES = (
     "Largemouth Bass", "Smallmouth Bass", "Crappie", "Walleye",
     "Northern Pike", "Catfish", "Trout",
 )
+LOCAL_REPORT_SNAPSHOT = {
+    "state": "MA",
+    "reported_on": "2026-11-05",
+    "source": "On The Water Massachusetts Fishing Report",
+    "source_url": (
+        "https://onthewater.com/fishing-reports/2026/11/"
+        "massachusetts-fishing-report-november-5-2026"
+    ),
+    "maximum_age_days": 14,
+    "waters": {
+        "lake quinsigamond": {
+            "species": "northern pike",
+            "lures": [
+                "3/8-oz spinnerbait with a wire leader",
+                "1/8-oz inline spinner with a wire leader",
+                "Live shiner under a slip float where legal",
+            ],
+            "note": "The report described recent pike catches as generally shallow.",
+            "reported_lure_terms": ["spinnerbait", "inline spinner", "shiner"],
+        },
+        "indian lake": {
+            "species": "northern pike",
+            "lures": [
+                "3/8-oz spinnerbait with a wire leader",
+                "1/8-oz inline spinner with a wire leader",
+                "Live shiner under a slip float where legal",
+            ],
+            "note": "The report described recent pike catches as generally shallow.",
+        },
+        "flint pond": {
+            "species": "northern pike",
+            "lures": [
+                "3/8-oz spinnerbait with a wire leader",
+                "1/8-oz inline spinner with a wire leader",
+                "Live shiner under a slip float where legal",
+            ],
+            "note": "The report described recent pike catches as generally shallow.",
+        },
+        "pratt's pond": {
+            "species": "trout",
+            "lures": [
+                "Green floating dough bait on a size-10 hook",
+                "1/8-oz black-and-gold inline spinner",
+                "1/8-oz black spoon",
+            ],
+            "note": "A local shop report specifically mentioned green dough bait for rainbow trout.",
+            "reported_lure_terms": ["dough bait"],
+        },
+    },
+}
 MA_WATER_FEATURES_URL = (
     "https://services1.arcgis.com/hGdibHYSPO59RG1h/arcgis/rest/services/"
     "Massachusetts_Water_Features/FeatureServer/8/query"
@@ -762,7 +812,15 @@ def _local_time_and_wind(location: dict) -> tuple[str, datetime, dict]:
         )
 
     next_day = local_now + timedelta(hours=24)
-    wind_speeds: dict[str, list[float]] = {"daytime": [], "nighttime": []}
+    forecast_signals: dict[str, dict[str, list[float]]] = {
+        category: {
+            "wind": [],
+            "temperature": [],
+            "cloud_cover": [],
+            "precipitation_probability": [],
+        }
+        for category in ("daytime", "nighttime")
+    }
     for period in periods:
         if not isinstance(period, dict) or not isinstance(period.get("isDaytime"), bool):
             continue
@@ -774,14 +832,61 @@ def _local_time_and_wind(location: dict) -> tuple[str, datetime, dict]:
             continue
         category = "daytime" if period["isDaytime"] else "nighttime"
         wind_values = re.findall(r"\d+(?:\.\d+)?", str(period.get("windSpeed", "")))
-        wind_speeds[category].extend(float(value) for value in wind_values)
+        forecast_signals[category]["wind"].extend(
+            float(value) for value in wind_values
+        )
+        temperature = period.get("temperature")
+        if isinstance(temperature, (int, float)):
+            forecast_signals[category]["temperature"].append(float(temperature))
+        elif isinstance(temperature, dict):
+            try:
+                temperature_value = float(temperature["value"])
+            except (KeyError, TypeError, ValueError):
+                temperature_value = None
+            if temperature_value is not None:
+                unit = str(temperature.get("unitCode", "")).casefold()
+                if unit.endswith(":degc"):
+                    temperature_value = temperature_value * 9 / 5 + 32
+                forecast_signals[category]["temperature"].append(temperature_value)
+        for property_name, signal_name in (
+            ("skyCover", "cloud_cover"),
+            ("probabilityOfPrecipitation", "precipitation_probability"),
+        ):
+            measurement = period.get(property_name)
+            if isinstance(measurement, dict):
+                try:
+                    value = float(measurement["value"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if math.isfinite(value):
+                    forecast_signals[category][signal_name].append(value)
 
-    wind = {
-        category: {
-            "maximum_wind_mph": max(values) if values else None,
+    wind = {}
+    for category, signals in forecast_signals.items():
+        temperatures = signals["temperature"]
+        wind[category] = {
+            "maximum_wind_mph": max(signals["wind"]) if signals["wind"] else None,
+            "average_air_temperature_f": (
+                round(sum(temperatures) / len(temperatures), 1)
+                if temperatures
+                else None
+            ),
+            "average_cloud_cover_percent": (
+                round(sum(signals["cloud_cover"]) / len(signals["cloud_cover"]))
+                if signals["cloud_cover"]
+                else None
+            ),
+            "maximum_precipitation_probability_percent": (
+                max(signals["precipitation_probability"])
+                if signals["precipitation_probability"]
+                else None
+            ),
+            "temperature_change_f": (
+                round(temperatures[-1] - temperatures[0], 1)
+                if len(temperatures) > 1
+                else None
+            ),
         }
-        for category, values in wind_speeds.items()
-    }
     wind["current"] = _current_station_wind(
         observation_stations_url, location, local_now
     )
@@ -1046,6 +1151,43 @@ def _ring_area(ring: list[list[float]]) -> float:
         - ring[index + 1][0] * ring[index][1]
         for index in range(len(ring) - 1)
     ) / 2
+
+
+def _distance_to_shoreline_miles(
+    latitude: float, longitude: float, ring: list[list[float]]
+) -> float:
+    if len(ring) < 2:
+        return float("inf")
+    latitude_scale = 69.0
+    longitude_scale = 69.0 * math.cos(math.radians(latitude))
+    point_x, point_y = longitude * longitude_scale, latitude * latitude_scale
+    nearest = float("inf")
+    for start, end in zip(ring, ring[1:]):
+        if len(start) < 2 or len(end) < 2:
+            continue
+        start_x, start_y = start[0] * longitude_scale, start[1] * latitude_scale
+        end_x, end_y = end[0] * longitude_scale, end[1] * latitude_scale
+        delta_x, delta_y = end_x - start_x, end_y - start_y
+        length_squared = delta_x * delta_x + delta_y * delta_y
+        fraction = (
+            max(
+                0.0,
+                min(
+                    1.0,
+                    ((point_x - start_x) * delta_x + (point_y - start_y) * delta_y)
+                    / length_squared,
+                ),
+            )
+            if length_squared
+            else 0.0
+        )
+        closest_x = start_x + fraction * delta_x
+        closest_y = start_y + fraction * delta_y
+        nearest = min(
+            nearest,
+            math.hypot(point_x - closest_x, point_y - closest_y),
+        )
+    return nearest
 
 
 def _ring_centroid(ring: list[list[float]]) -> tuple[float, float]:
@@ -1322,7 +1464,14 @@ def _compass_direction(degrees: float) -> str:
     ]
 
 
-def _shoreline_spots(shoreline_ring: list[list[float]], wind: dict) -> list[dict]:
+def _shoreline_spots(
+    shoreline_ring: list[list[float]],
+    wind: dict,
+    bathymetry: dict | None = None,
+    target_species: str = "",
+    access_spots: list[dict] | None = None,
+    access_message: str | None = None,
+) -> list[dict]:
     if len(shoreline_ring) < 4:
         return []
     latitude, longitude = _ring_centroid(shoreline_ring)
@@ -1344,26 +1493,121 @@ def _shoreline_spots(shoreline_ring: list[list[float]], wind: dict) -> list[dict
             (240, "Southwest shoreline check"),
         ]
 
-    candidates = sorted(
-        (
-            _bearing_degrees(latitude, longitude, point[1], point[0]),
-            point,
+    depth_ranges = {
+        "largemouth bass": (5, 20),
+        "smallmouth bass": (10, 30),
+        "crappie": (5, 15),
+        "walleye": (10, 30),
+        "northern pike": (5, 15),
+        "catfish": (5, 20),
+        "trout": (5, 15),
+    }
+    preferred_depth = depth_ranges.get(target_species.casefold(), (5, 20))
+    contour_points = []
+    if bathymetry and bathymetry.get("unit") == "ft":
+        for contour in bathymetry.get("contours", []):
+            coordinates = contour.get("coordinates", [])
+            if not coordinates:
+                continue
+            stride = max(1, len(coordinates) // 60)
+            contour_points.extend(
+                (float(point[0]), float(point[1]), float(contour["depth"]))
+                for point in coordinates[::stride]
+                if len(point) >= 2
+            )
+
+    def contour_context(point: list[float]) -> tuple[float, float | None]:
+        if not contour_points:
+            return 0.0, None
+        nearby = [
+            (
+                _distance_miles(point[1], point[0], contour_latitude, contour_longitude),
+                depth,
+            )
+            for contour_longitude, contour_latitude, depth in contour_points
+        ]
+        distance, depth = min(
+            nearby,
+            key=lambda item: (
+                item[0] + min(abs(item[1] - sum(preferred_depth) / 2) / 10, 2),
+                item[0],
+            ),
         )
-        for point in shoreline_ring
-    )
+        return distance, depth
+
+    candidates = []
+    for point in shoreline_ring:
+        bearing = _bearing_degrees(latitude, longitude, point[1], point[0])
+        contour_distance, contour_depth = contour_context(point)
+        depth_penalty = (
+            min(abs(contour_depth - sum(preferred_depth) / 2) / 10, 2)
+            if contour_depth is not None
+            else 0
+        )
+        candidates.append(
+            (bearing, point, contour_distance, contour_depth, depth_penalty)
+        )
+
     selected = []
+    for access in access_spots or []:
+        access_type = access.get("access_type")
+        if access_type not in {"Shore access", "Fishing pier"}:
+            continue
+        point_latitude = access.get("latitude")
+        point_longitude = access.get("longitude")
+        if not isinstance(point_latitude, (int, float)) or not isinstance(
+            point_longitude, (int, float)
+        ):
+            continue
+        shore_distance = _distance_to_shoreline_miles(
+            point_latitude, point_longitude, shoreline_ring
+        )
+        if shore_distance > 0.15:
+            continue
+        if any(
+            _distance_miles(
+                point_latitude,
+                point_longitude,
+                existing["latitude"],
+                existing["longitude"],
+            )
+            < 0.05
+            for existing in selected
+        ):
+            continue
+        selected.append(
+            {
+                "latitude": point_latitude,
+                "longitude": point_longitude,
+                "label": f"{access_type} · {access.get('name', 'public site')}",
+                "reason": (
+                    f"{access_type} is explicitly identified by "
+                    f"{access.get('source', 'the access dataset')} and lies "
+                    "beside this waterbody. Confirm current hours, restrictions, "
+                    "and conditions before fishing."
+                ),
+                "access_type": access_type,
+                "access_status": access.get("access_status"),
+                "source": access.get("source"),
+            }
+        )
+
     for target_bearing, label in targets:
         ordered = sorted(
             candidates,
-            key=lambda item: min(
-                (item[0] - target_bearing) % 360,
-                (target_bearing - item[0]) % 360,
+            key=lambda item: (
+                min(
+                    (item[0] - target_bearing) % 360,
+                    (target_bearing - item[0]) % 360,
+                )
+                + min(item[2], 0.5) * 12
+                + item[4] * 4
             ),
         )
         point = next(
             (
                 candidate
-                for _, candidate in ordered
+                for _, candidate, _, _, _ in ordered
                 if all(
                     _distance_miles(
                         candidate[1],
@@ -1379,16 +1623,41 @@ def _shoreline_spots(shoreline_ring: list[list[float]], wind: dict) -> list[dict
         )
         if point is None:
             continue
+        candidate = next(item for item in ordered if item[1] is point)
+        contour_distance, contour_depth = candidate[2], candidate[3]
         if direction is not None and speed is not None and speed >= 3:
             reason = (
                 f"Wind from {current.get('wind_direction')} points toward the "
                 f"{_compass_direction((float(direction) + 180) % 360)} side. "
-                "Fan-cast parallel to shore and around nearby points or inlets."
+                "Fan-cast parallel to shore and around nearby points or inlets; "
+                "this is a search area, not a proven hotspot."
             )
         else:
             reason = (
-                "No usable current wind direction; this is only a shoreline "
+                "No usable current wind direction; this is a general shoreline "
                 "checkpoint, not a confirmed hotspot."
+            )
+        if contour_depth is not None and contour_distance <= 0.15:
+            reason += (
+                f" A published {contour_depth:g}-ft contour is nearby; it is "
+                "depth context, not a measured depth at the bank."
+            )
+        if access_message:
+            reason += f" {access_message}"
+        elif not any(
+            _distance_miles(
+                point[1],
+                point[0],
+                access.get("latitude", float("inf")),
+                access.get("longitude", float("inf")),
+            )
+            <= 0.15
+            for access in access_spots or []
+            if access.get("access_type") in {"Shore access", "Fishing pier"}
+        ):
+            reason += (
+                " Public shore access is not verified for this pin; use only "
+                "from a lawful, open access point."
             )
         selected.append(
             {
@@ -1396,9 +1665,10 @@ def _shoreline_spots(shoreline_ring: list[list[float]], wind: dict) -> list[dict
                 "longitude": point[0],
                 "label": label,
                 "reason": reason,
+                "access_type": "Unverified shoreline section",
             }
         )
-    return selected
+    return selected[:3]
 
 
 def _wind_shoreline_guidance(wind: dict, water_type: str) -> dict:
@@ -1447,10 +1717,38 @@ def _wind_shoreline_guidance(wind: dict, water_type: str) -> dict:
 
 
 def _waterbody_map_data(
-    location: dict, state: str, wind: dict, water_body: str | None = None
+    location: dict,
+    state: str,
+    wind: dict,
+    water_body: str | None = None,
+    target_species: str = "",
+    access_data: dict | None = None,
 ) -> dict:
     outline = _waterbody_geometry(location, state, water_body)
     bathymetry = _bathymetry_contours(location, state, water_body)
+    shoreline_spots = _shoreline_spots(
+        outline["shoreline_ring"],
+        wind,
+        bathymetry,
+        target_species,
+        (access_data or {}).get("shore_access", []),
+        (access_data or {}).get("message"),
+    )
+    access_source_urls = {
+        "Massachusetts Office of Fishing and Boating Access": (
+            "https://www.mass.gov/info-details/saltwater-fishing-public-access"
+        ),
+        "NH Fish and Game / NH GRANIT": (
+            "https://www.wildlife.nh.gov/fishing/new-hampshire-fishing-map"
+        ),
+        "OpenStreetMap": "https://www.openstreetmap.org/copyright",
+    }
+    used_access_sources = {
+        spot["source"]
+        for spot in shoreline_spots
+        if spot.get("access_type") in {"Shore access", "Fishing pier"}
+        and isinstance(spot.get("source"), str)
+    }
     return {
         "center": {
             "latitude": location["latitude"],
@@ -1459,7 +1757,12 @@ def _waterbody_map_data(
         "geometry": outline["geometry"],
         "boundary_source": outline["source"],
         "boundary_message": outline["message"],
-        "shoreline_spots": _shoreline_spots(outline["shoreline_ring"], wind),
+        "shoreline_spots": shoreline_spots,
+        "access_sources": [
+            {"name": source, "url": access_source_urls[source]}
+            for source in sorted(used_access_sources)
+            if source in access_source_urls
+        ],
         "wind_guidance": _wind_shoreline_guidance(
             wind, location.get("water_type", "waterbody")
         ),
@@ -1515,6 +1818,19 @@ def _arcgis_nearby_features(
     return features
 
 
+def _explicit_shore_access_type(value: str) -> str | None:
+    normalized = re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip()
+    if any(term in normalized for term in ("boat ramp", "boat launch", "launch ramp")):
+        return "Boat ramp"
+    if any(term in normalized for term in ("kayak launch", "canoe launch")):
+        return "Kayak launch"
+    if "pier" in normalized:
+        return "Fishing pier"
+    if any(term in normalized for term in ("shore access", "shore fishing", "shoreline access", "bank access", "shore bank")):
+        return "Shore access"
+    return None
+
+
 def _nearby_fishing_access(location: dict, state: str = "") -> dict:
     latitude = location["latitude"]
     longitude = location["longitude"]
@@ -1530,6 +1846,8 @@ def _nearby_fishing_access(location: dict, state: str = "") -> dict:
     )
     fishing_spots = []
     parking = []
+    shore_access = []
+    access_errors = []
     if state == "MA":
         try:
             features = _arcgis_nearby_features(
@@ -1541,11 +1859,11 @@ def _nearby_fishing_access(location: dict, state: str = "") -> dict:
                 "FACNAME,TOWN,RESTRICTED,FEE,PARKING,STREET_PERMITED,PENDING,COMMENTS",
                 "Massachusetts Office of Fishing and Boating Access",
             )
-        except DataSourceError as error:
-            raise HTTPException(
-                status_code=502,
-                detail="Massachusetts public fishing-access data is unavailable. Please try again later.",
-            ) from error
+        except DataSourceError:
+            access_errors.append(
+                "Massachusetts public fishing-access data is unavailable."
+            )
+            features = []
         for feature in features:
             if not isinstance(feature, dict):
                 continue
@@ -1588,6 +1906,16 @@ def _nearby_fishing_access(location: dict, state: str = "") -> dict:
                 "source": "Massachusetts Office of Fishing and Boating Access",
                 "_access_rank": rank,
             }
+            access_type = _explicit_shore_access_type(
+                " ".join(
+                    str(attributes.get(field) or "")
+                    for field in ("FACNAME", "COMMENTS")
+                )
+            )
+            if access_type:
+                item["access_type"] = access_type
+                if access_type in {"Shore access", "Fishing pier"}:
+                    shore_access.append(item.copy())
             fishing_spots.append(item)
             if attributes.get("PARKING"):
                 parking.append({**item, "name": f"{item['name']} parking"})
@@ -1603,11 +1931,11 @@ def _nearby_fishing_access(location: dict, state: str = "") -> dict:
                 "SHOREBANK_,FEE,LATITUDE,LONGITUDE",
                 "New Hampshire public-water access dataset",
             )
-        except DataSourceError as error:
-            raise HTTPException(
-                status_code=502,
-                detail="New Hampshire public fishing-access data is unavailable. Please try again later.",
-            ) from error
+        except DataSourceError:
+            access_errors.append(
+                "New Hampshire public fishing-access data is unavailable."
+            )
+            features = []
         for feature in features:
             if not isinstance(feature, dict):
                 continue
@@ -1649,7 +1977,18 @@ def _nearby_fishing_access(location: dict, state: str = "") -> dict:
                 "_access_rank": rank,
             }
             if str(attributes.get("SHOREBANK_", "")).casefold() in {"y", "yes"}:
+                item["access_type"] = "Shore access"
                 fishing_spots.append(item)
+                shore_access.append(item.copy())
+            else:
+                access_type = _explicit_shore_access_type(
+                    str(attributes.get("ACCESS_TYP") or "")
+                )
+                if access_type:
+                    item["access_type"] = access_type
+                    if access_type in {"Shore access", "Fishing pier"}:
+                        fishing_spots.append(item)
+                        shore_access.append(item.copy())
             if attributes.get("PARKING_TY"):
                 parking.append({**item, "name": f"{item['name']} parking"})
 
@@ -1660,10 +1999,14 @@ def _nearby_fishing_access(location: dict, state: str = "") -> dict:
         )
     except DataSourceError as error:
         if not fishing_spots and not parking:
+            detail = "Could not load mapped fishing spots and parking."
+            if access_errors:
+                detail += " " + " ".join(access_errors)
             raise HTTPException(
                 status_code=502,
-                detail="Could not load mapped fishing spots and parking. Please try again later.",
+                detail=detail + " Please try again later.",
             ) from error
+        access_errors.append("OpenStreetMap fishing-access data is unavailable.")
         result = {"elements": []}
 
     elements = result.get("elements")
@@ -1734,6 +2077,16 @@ def _nearby_fishing_access(location: dict, state: str = "") -> dict:
             "source": "OpenStreetMap",
             "_access_rank": access_rank,
         }
+        access_type = None
+        if tags.get("man_made") == "pier" or tags.get("leisure") == "pier":
+            access_type = "Fishing pier"
+        elif str(tags.get("fishing", "")).casefold() == "shore" or str(
+            tags.get("fishing_access", "")
+        ).casefold() == "shore":
+            access_type = "Shore access"
+        if is_fishing and access_type in {"Shore access", "Fishing pier"}:
+            point["access_type"] = access_type
+            shore_access.append(point.copy())
         (fishing_spots if is_fishing else parking).append(point)
 
     def nearest_first(points: list[dict]) -> list[dict]:
@@ -1753,6 +2106,8 @@ def _nearby_fishing_access(location: dict, state: str = "") -> dict:
         "search_radius_miles": round(radius_miles, 1),
         "fishing_spots": nearest_first(fishing_spots),
         "parking": nearest_first(parking),
+        "shore_access": nearest_first(shore_access),
+        "message": " ".join(access_errors) if access_errors else None,
         "attribution": (
             "MassGIS, Massachusetts Office of Fishing and Boating Access, and OpenStreetMap contributors"
             if state == "MA"
@@ -1907,41 +2262,293 @@ def _season_for(month: int) -> str:
     return "fall"
 
 
-def _lure_instruction(lure: str, species: str, water_type: str = "waterbody") -> str:
+def _with_lure_pattern(lure: str, species: str) -> str:
+    if re.search(
+        r"\b(black|white|green|chartreuse|silver|gold|smoke|shad|glow|natural|brown|copper)\b",
+        lure.casefold(),
+    ) or any(term in lure.casefold() for term in ("minnow", "shiner", "cut bait", "nightcrawler")):
+        return lure
+    species_key = species.casefold()
+    if species_key in {"largemouth bass", "smallmouth bass"}:
+        pattern = (
+            "green-pumpkin"
+            if any(term in lure.casefold() for term in ("jig", "worm", "ned rig", "tube"))
+            else "natural-shad-pattern"
+        )
+    elif species_key == "crappie":
+        pattern = "chartreuse"
+    elif species_key == "walleye":
+        pattern = "natural-shad-pattern"
+    elif species_key == "northern pike":
+        pattern = "natural-minnow-pattern"
+    elif species_key == "trout":
+        pattern = "black-and-gold"
+    else:
+        return lure
+    return f"{pattern} {lure}"
+
+
+def _lure_name_with_details(lure: str, species: str) -> str:
+    name = re.sub(r"\bSenko\b", "stick worm", lure, flags=re.IGNORECASE)
+    if "live shiner" in name.casefold():
+        return "3- to 4-inch live shiner under a slip float where legal"
+    if "cut bait" in name.casefold():
+        return "2- to 3-inch cut-bait strip on a 1/2-oz slip-sinker rig"
+    if "nightcrawler" in name.casefold() and "slip-sinker" in name.casefold():
+        return "Whole nightcrawler on a 1/2-oz slip-sinker rig"
+    if "chicken liver" in name.casefold():
+        return "1-inch chicken-liver piece on a 1/2-oz slip-sinker rig"
+    if "dough bait" in name.casefold():
+        return "Green floating dough bait on a size-10 hook"
+
+    has_measurement = bool(
+        re.search(r"\b\d+(?:/\d+)?(?:\.\d+)?-oz\b|\b\d+(?:\.\d+)?-inch\b", name)
+    )
+    if has_measurement:
+        if "jerkbait" in name.casefold() and "-inch" not in name.casefold():
+            name = f"3.5- to 4-inch {name}"
+        elif "ned rig" in name.casefold() and "-inch" not in name.casefold():
+            name = f"3-inch {name}"
+        elif "tube" in name.casefold() and "-inch" not in name.casefold():
+            name = f"2.75-inch {name}"
+        elif any(term in name.casefold() for term in ("swimbait", "paddletail")) and "-inch" not in name.casefold():
+            name = f"3.5-inch {name}"
+        if "stick worm" in name.casefold() and "weightless" not in name.casefold():
+            name += " (weightless, 1/0 hook)"
+        return _with_lure_pattern(name, species)
+
+    species_key = species.casefold()
+    if (
+        "jerkbait" in name.casefold()
+        or "minnow-style" in name.casefold()
+        or "minnow bait" in name.casefold()
+    ):
+        size = "3.5- to 4-inch, 3/8-oz" if "bass" in species_key else "3-inch, 1/4-oz"
+        return _with_lure_pattern(f"{size} {name}", species)
+    if "ned rig" in name.casefold():
+        return _with_lure_pattern(f"3-inch {name} on a 1/10-oz mushroom jig", species)
+    if "tube" in name.casefold():
+        return _with_lure_pattern(f"2.75-inch {name} on a 1/8-oz jig head", species)
+    if "spinnerbait" in name.casefold():
+        weight = "1/2-oz" if species_key == "northern pike" else "3/8-oz"
+        return _with_lure_pattern(f"{weight} {name}", species)
+    if "inline spinner" in name.casefold() or name.casefold().endswith(" spinner"):
+        weight = "1/8-oz" if species_key == "trout" else "1/4-oz"
+        return _with_lure_pattern(f"{weight} {name}", species)
+    if "spoon" in name.casefold() or "blade bait" in name.casefold():
+        weight = "1/2-oz" if species_key == "northern pike" else "1/4-oz"
+        return _with_lure_pattern(f"{weight} {name}", species)
+    if "crankbait" in name.casefold():
+        return _with_lure_pattern(f"2.5-inch, 3/8-oz {name}", species)
+    if "swimbait" in name.casefold() or "paddletail" in name.casefold():
+        return _with_lure_pattern(f"3.5-inch {name} on a 1/4-oz jig head", species)
+    if "topwater" in name.casefold() or "walking bait" in name.casefold():
+        return _with_lure_pattern(f"3.5-inch {name}", species)
+    if "stick worm" in name.casefold():
+        return _with_lure_pattern(f"4-inch {name} (weightless, 1/0 hook)", species)
+    if "frog" in name.casefold() or "buzzbait" in name.casefold():
+        titled = (
+            f"1/2-oz weedless {name}"
+            if "frog" in name.casefold()
+            else f"3/8-oz {name}"
+        )
+        return _with_lure_pattern(titled, species)
+    if "jig" in name.casefold():
+        return _with_lure_pattern(f"1/8-oz {name}", species)
+    if (
+        "slip bobber" in name.casefold()
+        or "under a float" in name.casefold()
+        or "under slip float" in name.casefold()
+    ):
+        return f"2-inch minnow under a slip float"
+    return _with_lure_pattern(name, species)
+
+
+def _backup_lure(lure: str, species: str) -> str:
+    name = lure.casefold()
+    species_key = species.casefold()
+    if species_key == "largemouth bass":
+        return (
+            "3-inch green-pumpkin Ned rig on a 1/10-oz mushroom jig"
+            if any(term in name for term in ("spinner", "crankbait", "jerkbait", "topwater", "swimbait"))
+            else "3/8-oz white spinnerbait"
+        )
+    if species_key == "smallmouth bass":
+        return (
+            "2.75-inch green-pumpkin tube on a 1/8-oz jig head"
+            if any(term in name for term in ("spinner", "crankbait", "jerkbait", "topwater", "swimbait"))
+            else "3-inch shad paddletail on a 1/4-oz jig head"
+        )
+    if species_key == "crappie":
+        return (
+            "1/16-oz chartreuse jig under a slip float"
+            if "minnow" in name or "bobber" in name or "float" in name
+            else "2-inch minnow under a slip float"
+        )
+    if species_key == "walleye":
+        return (
+            "1/4-oz jig tipped with a 3-inch minnow"
+            if any(term in name for term in ("crankbait", "jerkbait", "spinner", "spoon"))
+            else "3/8-oz shad-pattern crankbait"
+        )
+    if species_key == "northern pike":
+        return (
+            "1/2-oz silver spoon with a wire leader"
+            if any(term in name for term in ("spinner", "swimbait", "topwater"))
+            else "3/8-oz spinnerbait with a wire leader"
+        )
+    if species_key == "catfish":
+        return (
+            "Whole nightcrawler on a 1/2-oz slip-sinker rig"
+            if "cut bait" in name or "liver" in name
+            else "2- to 3-inch cut-bait strip on a 1/2-oz slip-sinker rig"
+        )
+    return (
+        "1/8-oz black-and-gold inline spinner"
+        if any(term in name for term in ("spoon", "jig", "float", "dough"))
+        else "1/8-oz black spoon"
+    )
+
+
+def _lure_reason(
+    species: str, temperature_band: str, water_type: str, report_note: str | None
+) -> str:
+    if report_note:
+        return report_note
+    season_note = {
+        "cold": "The nearby water reading is cold, so a slow presentation with pauses is the conservative choice.",
+        "cool": "Cool nearby water favors a controlled retrieve and time for the bait to stay in the strike zone.",
+        "warming": "The nearby water reading is in a transition range; cover both shallow edges and the first nearby break.",
+        "warm": "Warm-water fish may use shade, weeds, and nearby depth changes; the exact cover is not mapped at this bank.",
+        "hot": "Warm conditions make shade and cooler adjacent water worth checking; avoid assuming the whole lake is uniformly warm.",
+        "unknown": "No nearby water-temperature reading is available, so this is a seasonal starting pattern rather than a local measurement.",
+    }.get(temperature_band, "This is a seasonal starting pattern, not a confirmed local fish location.")
+    if species.casefold() == "smallmouth bass":
+        species_note = "For smallmouth, use the presentation around rock or gravel only where that bottom is actually visible or mapped."
+    elif species.casefold() == "largemouth bass":
+        species_note = "For largemouth, check the accessible weed edge, shade, or point rather than assuming a specific bed or dock."
+    elif species.casefold() == "crappie":
+        species_note = "For crappie, vary the bait depth beside visible cover; brush and fish depth are not confirmed by the map."
+    elif species.casefold() == "walleye":
+        species_note = "For walleye, prioritize low-light edges and mapped depth breaks where present; no local forage survey is available."
+    elif species.casefold() == "northern pike":
+        species_note = "For pike, work weed edges or open pockets and use a wire leader; vegetation is not mapped at this pin."
+    elif species.casefold() == "catfish":
+        species_note = "For catfish, keep the bait near bottom and let scent disperse; use only bait legal in this state."
+    else:
+        species_note = "For trout, fish the cooler or flowing water available from shore; this system does not confirm a recent stocking at this water."
+    return f"{season_note} {species_note}"
+
+
+def _recent_local_report(
+    state: str,
+    water_body: str,
+    species: str,
+    local_date: date,
+) -> dict | None:
+    if state != LOCAL_REPORT_SNAPSHOT["state"]:
+        return None
+    report_date = date.fromisoformat(LOCAL_REPORT_SNAPSHOT["reported_on"])
+    age = (local_date - report_date).days
+    if age < 0 or age > LOCAL_REPORT_SNAPSHOT["maximum_age_days"]:
+        return None
+    unqualified_name = water_body.split(",", 1)[0]
+    normalized_name = re.sub(r"[^a-z0-9]+", " ", unqualified_name.casefold()).strip()
+    for known_water, report in LOCAL_REPORT_SNAPSHOT["waters"].items():
+        normalized_known = re.sub(r"[^a-z0-9]+", " ", known_water.casefold()).strip()
+        if normalized_known != normalized_name:
+            continue
+        if report["species"] != species.casefold():
+            return None
+        return {
+            **report,
+            "reported_on": LOCAL_REPORT_SNAPSHOT["reported_on"],
+            "source": LOCAL_REPORT_SNAPSHOT["source"],
+            "source_url": LOCAL_REPORT_SNAPSHOT["source_url"],
+        }
+    return None
+
+
+def _lure_instruction(
+    lure: str,
+    species: str,
+    water_type: str = "waterbody",
+    temperature_band: str = "unknown",
+    period_weather: dict | None = None,
+    night: bool = False,
+    backup: str | None = None,
+    report_note: str | None = None,
+) -> str:
     name = lure.casefold()
     cast_areas = {
-        "pond": "the bank-side weed edge",
-        "reservoir": "a point, cove mouth, or inflow",
+        "pond": "the accessible outer weed edge, shade, or a point",
+        "reservoir": "an accessible point, cove mouth, or inflow",
         "lake": "a point or windblown shoreline",
-        "river": "an eddy or current seam",
-        "stream": "a riffle-to-current-seam transition",
+        "river": "an eddy or current seam from the bank",
+        "stream": "a riffle-to-current-seam transition from the bank",
     }
     cast_area = cast_areas.get(water_type, "visible shoreline cover")
     if "slip-sinker" in name:
-        return f"Cast near {cast_area}; let the bait rest on bottom and keep the line slightly slack."
-    if "bobber" in name or "under a float" in name:
-        return f"Cast beside brush near {cast_area}; let the float drift naturally at the fish's depth."
-    if "jerkbait" in name or "minnow-style" in name or "minnow bait" in name:
-        return f"Cast parallel to {cast_area}; retrieve with two twitches, pause, then repeat."
-    if "frog" in name or "topwater" in name or "buzzbait" in name:
-        return f"Cast toward {cast_area}; work it steadily, pausing at openings."
-    if "spinnerbait" in name:
-        return f"Cast across {cast_area}; retrieve steadily and slow briefly beside cover."
-    if "crankbait" in name:
-        return f"Cast across {cast_area}; retrieve steadily, then pause after it bumps cover."
-    if "spoon" in name or "blade bait" in name:
-        return f"Cast across {cast_area}; lift briefly and let it flutter down between lifts."
-    if "swimbait" in name or "paddletail" in name or "swim jig" in name:
-        return f"Cast parallel to {cast_area}; swim it steadily just above the cover."
-    if "ned rig" in name or "tube jig" in name or "hair jig" in name or "jig" in name:
-        return f"Cast near {cast_area}; let it reach bottom, then drag or hop it slowly."
-    if "stick worm" in name or "worm" in name:
-        return f"Cast beside shade or cover near {cast_area}; let it sink, then lift gently and pause."
-    if "spinner" in name:
-        return f"Cast across {cast_area}; retrieve just fast enough to keep the blade turning."
-    if species.casefold() == "catfish":
-        return f"Cast beyond {cast_area}; keep bait on bottom and reel in slack without moving it."
-    return f"Cast near {cast_area}; retrieve slowly with short pauses."
+        technique = f"Cast beyond {cast_area}; keep the bait on bottom and retrieve only to remove slack or reset it, without dragging it."
+    elif "bobber" in name or "under a float" in name or "slip float" in name:
+        technique = f"Cast beside visible cover near {cast_area}; set the float just above the bottom or suspended fish and retrieve by letting it drift naturally."
+    elif "jerkbait" in name or "minnow-style" in name or "minnow bait" in name:
+        pause = "5-8 seconds in cold water" if temperature_band in {"cold", "cool"} else "2-4 seconds"
+        technique = f"Cast parallel to {cast_area}; retrieve with two twitches, pause {pause}, then repeat."
+    elif "frog" in name or "topwater" in name or "buzzbait" in name:
+        technique = f"Cast along {cast_area}; retrieve steadily, pausing a frog at vegetation openings."
+    elif "spinnerbait" in name:
+        technique = f"Cast across {cast_area}; retrieve steadily just fast enough to keep the blades turning, then slow beside cover."
+    elif "crankbait" in name:
+        technique = f"Cast across {cast_area}; retrieve until it reaches its running depth and pause briefly after contact with cover."
+    elif "spoon" in name or "blade bait" in name:
+        technique = f"Cast across {cast_area}; retrieve with a controlled lift-and-fall and keep the lure above snags."
+    elif "swimbait" in name or "paddletail" in name or "swim jig" in name:
+        technique = f"Cast parallel to {cast_area}; retrieve steadily just above the visible or mapped cover."
+    elif "ned rig" in name or "tube jig" in name or "hair jig" in name or "jig" in name:
+        technique = f"Cast near {cast_area}; retrieve by letting it touch bottom, then drag it a few inches, pause, and repeat."
+    elif "stick worm" in name or "worm" in name:
+        technique = f"Cast beside shade or cover near {cast_area}; retrieve by letting it sink on a slack line, then lift gently and pause."
+    elif "spinner" in name:
+        technique = f"Cast across {cast_area}; retrieve only fast enough to keep the blade rotating."
+    elif "dough bait" in name:
+        technique = f"Cast to a clean bottom near {cast_area}; leave the bait still and retrieve periodically to check it."
+    else:
+        technique = f"Cast near {cast_area}; retrieve slowly with short pauses."
+
+    title = _lure_name_with_details(lure, species)
+    reason = _lure_reason(species, temperature_band, water_type, report_note)
+    conditions = period_weather or {}
+    cloud_cover = conditions.get("average_cloud_cover_percent")
+    precipitation = conditions.get("maximum_precipitation_probability_percent")
+    forecast_low_light = (
+        isinstance(cloud_cover, (int, float))
+        and cloud_cover >= 60
+        or isinstance(precipitation, (int, float))
+        and precipitation >= 50
+    )
+    moving_presentation = any(
+        term in name
+        for term in (
+            "spinner",
+            "crankbait",
+            "spoon",
+            "swimbait",
+            "topwater",
+            "buzzbait",
+            "blade bait",
+        )
+    )
+    if forecast_low_light and moving_presentation:
+        reason += " Forecast clouds or rain favor a visible, moving presentation; switch to a high-contrast color if the water is stained."
+    elif night:
+        reason += " At night, make slow, accurate casts along the bank rather than covering open water blindly."
+    backup_text = (
+        f" Backup: {backup} if fish ignore this presentation or the conditions change."
+        if backup
+        else ""
+    )
+    return f"{title}. {technique} {reason}{backup_text}"
 
 
 def _lure_identity(lure: str) -> str:
@@ -1960,6 +2567,9 @@ def _recommend_lures(
     season: str,
     weather: dict,
     water_type: str = "waterbody",
+    state: str = "",
+    water_body: str = "",
+    local_date: date | None = None,
 ) -> dict:
     species = target_species or "Largemouth Bass"
     temp = water_temperature_f
@@ -2123,62 +2733,148 @@ def _recommend_lures(
                 "river": "Black 1/4-oz finesse jig with craw trailer",
                 "stream": "Black 1/8-oz tube jig",
             }.get(water_type, night_pick)
-        day_identity = _lure_identity(day_pick)
-        night_identity = _lure_identity(night_pick)
-        day_lures = [
-            day_pick
-        ] + [lure for lure in day_lures if _lure_identity(lure) != day_identity]
-        night_lures = [
-            night_pick
-        ] + [lure for lure in night_lures if _lure_identity(lure) != night_identity]
+        if temp_band not in {"cold", "cool"} or cold_water and key == "largemouth bass":
+            day_identity = _lure_identity(day_pick)
+            night_identity = _lure_identity(night_pick)
+            day_lures = [
+                day_pick
+            ] + [lure for lure in day_lures if _lure_identity(lure) != day_identity]
+            night_lures = [
+                night_pick
+            ] + [lure for lure in night_lures if _lure_identity(lure) != night_identity]
+
     daytime = weather.get("daytime") or {}
-    day_wind = daytime.get("maximum_wind_mph")
-    if isinstance(day_wind, (int, float)) and day_wind >= 10:
-        moving_lure = next(
-            (
-                index
-                for index, lure in enumerate(day_lures)
-                if any(
-                    keyword in lure.casefold()
-                    for keyword in (
-                        "spinner",
-                        "crankbait",
-                        "spoon",
-                        "swimbait",
-                        "topwater",
-                        "buzzbait",
-                    )
-                )
-            ),
-            None,
+    nighttime = weather.get("nighttime") or {}
+
+    def prioritize_conditions(lures: list[str], conditions: dict) -> list[str]:
+        wind_speed = conditions.get("maximum_wind_mph")
+        cloud_cover = conditions.get("average_cloud_cover_percent")
+        rain_probability = conditions.get("maximum_precipitation_probability_percent")
+        air_temperature_change = conditions.get("temperature_change_f")
+        average_air_temperature = conditions.get("average_air_temperature_f")
+        cold_front = (
+            isinstance(air_temperature_change, (int, float))
+            and air_temperature_change <= -6
+            and (temp is None or temp < 68)
         )
-        if moving_lure is not None:
-            day_lures.insert(0, day_lures.pop(moving_lure))
+        cold_air = (
+            isinstance(average_air_temperature, (int, float))
+            and average_air_temperature <= 40
+            and (temp is None or temp < 58)
+        )
+        if cold_front or cold_air:
+            slow_lure = next(
+                (
+                    index
+                    for index, lure in enumerate(lures)
+                    if any(term in lure.casefold() for term in ("ned", "tube", "jig", "worm", "minnow under"))
+                ),
+                None,
+            )
+            if slow_lure is not None:
+                lures.insert(0, lures.pop(slow_lure))
+            return lures
+        low_light_or_wind = (
+            isinstance(wind_speed, (int, float))
+            and wind_speed >= 10
+            or isinstance(cloud_cover, (int, float))
+            and cloud_cover >= 60
+            or isinstance(rain_probability, (int, float))
+            and rain_probability >= 50
+        )
+        if low_light_or_wind:
+            moving_lure = next(
+                (
+                    index
+                    for index, lure in enumerate(lures)
+                    if any(
+                        keyword in lure.casefold()
+                        for keyword in (
+                            "spinner",
+                            "crankbait",
+                            "spoon",
+                            "swimbait",
+                            "topwater",
+                            "buzzbait",
+                            "blade bait",
+                        )
+                    )
+                ),
+                None,
+            )
+            if moving_lure is not None:
+                lures.insert(0, lures.pop(moving_lure))
+        return lures
+
+    day_lures = prioritize_conditions(day_lures, daytime)
+    night_lures = prioritize_conditions(night_lures, nighttime)
+    local_report = (
+        _recent_local_report(state, water_body, species, local_date)
+        if local_date is not None and water_body
+        else None
+    )
+    if local_report:
+        day_lures = local_report["lures"] + [
+            lure
+            for lure in day_lures
+            if all(
+                _lure_identity(lure) != _lure_identity(reported_lure)
+                for reported_lure in local_report["lures"]
+            )
+        ]
     day_lures = day_lures[:3]
     night_lures = night_lures[:3]
     if temp is None:
         basis = f"Seasonal picks for {species}; no recent nearby water-temperature reading."
     else:
         basis = f"Picks for {species} using nearby water temperature ({temp:.1f}°F)."
+    if local_report:
+        basis += (
+            f" Exact-waterbody report dated {local_report['reported_on']} "
+            f"({local_report['source']}); short-term influence expires after "
+            f"{LOCAL_REPORT_SNAPSHOT['maximum_age_days']} days."
+        )
+
+    def build_picks(lures: list[str], night: bool, conditions: dict) -> list[dict]:
+        picks = []
+        for index, lure in enumerate(lures):
+            backup = _backup_lure(lure, species)
+            detailed_lure = _lure_name_with_details(lure, species)
+            if (
+                species.casefold() == "northern pike"
+                and "wire leader" not in detailed_lure.casefold()
+            ):
+                detailed_lure += " with a 12-inch wire leader"
+            report_note = None
+            if local_report and not night and any(
+                term in lure.casefold()
+                for term in local_report["reported_lure_terms"]
+            ):
+                report_note = local_report["note"]
+            picks.append(
+                {
+                    "rank": index + 1,
+                    "lure": detailed_lure,
+                    "how": _lure_instruction(
+                        detailed_lure,
+                        species,
+                        water_type,
+                        temp_band,
+                        conditions,
+                        night,
+                        backup,
+                        report_note,
+                    ),
+                    "backup": backup,
+                }
+            )
+        return picks
+
     return {
         "species": species,
         "basis": basis,
-        "day": [
-            {
-                "rank": index + 1,
-                "lure": lure,
-                "how": _lure_instruction(lure, species, water_type),
-            }
-            for index, lure in enumerate(day_lures)
-        ],
-        "night": [
-            {
-                "rank": index + 1,
-                "lure": lure,
-                "how": _lure_instruction(lure, species, water_type),
-            }
-            for index, lure in enumerate(night_lures)
-        ],
+        "day": build_picks(day_lures, False, daytime),
+        "night": build_picks(night_lures, True, nighttime),
     }
 
 
@@ -2213,9 +2909,30 @@ def build_recommendation_report(payload: RecommendationRequest) -> dict:
     moon = _moon_phase(local_now)
     water_type = location.get("water_type", "waterbody")
     recommendations = _recommend_lures(
-        target_species, temp, season, weather, water_type
+        target_species,
+        temp,
+        season,
+        weather,
+        water_type,
+        state,
+        water_body,
+        local_now.date(),
     )
-    waterbody_map = _waterbody_map_data(location, state, weather, water_body)
+    access_message = None
+    access_data: dict[str, Any]
+    try:
+        access_data = _nearby_fishing_access(location, state)
+    except HTTPException as error:
+        access_data = {"shore_access": []}
+        access_message = (
+            "The public-access lookup failed, so access at these shoreline pins "
+            f"remains unverified ({error.detail})."
+        )
+    if access_message:
+        access_data["message"] = access_message
+    waterbody_map = _waterbody_map_data(
+        location, state, weather, water_body, target_species, access_data
+    )
     return {
         "water_body": water_body,
         "state": {"code": state, "name": STATES[state]},
