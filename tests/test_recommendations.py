@@ -27,6 +27,7 @@ class RecommendationTests(unittest.TestCase):
             "place": "Carnegie Lake",
             "reference": "USGS site 01400000 (Carnegie Lake)",
             "provider": "USGS",
+            "water_type": "lake",
             "site": {
                 "name": "Carnegie Lake",
                 "site_type": "LK",
@@ -62,9 +63,22 @@ class RecommendationTests(unittest.TestCase):
 
         self.assertEqual(len(report["recommendations"]["day"]), 3)
         self.assertEqual(len(report["recommendations"]["night"]), 3)
+        self.assertEqual(
+            len({server._lure_identity(pick["lure"]) for pick in report["recommendations"]["day"]}),
+            3,
+        )
+        self.assertEqual(
+            len({server._lure_identity(pick["lure"]) for pick in report["recommendations"]["night"]}),
+            3,
+        )
         self.assertEqual(report["recommendations"]["species"], "Largemouth Bass")
         self.assertEqual(report["water_temperature"]["temperature_f"], 62.6)
         self.assertEqual(report["state"]["code"], "NJ")
+        self.assertEqual(report["water_type"], "lake")
+        self.assertEqual(
+            report["recommendations"]["day"][0]["lure"],
+            "3/8-oz suspending shad-pattern jerkbait",
+        )
         self.assertNotIn("weather", report)
         self.assertNotIn("sources", report)
         self.assertNotIn("behavior_context", report)
@@ -88,6 +102,56 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(location["provider"], "OpenStreetMap")
         self.assertEqual(location["latitude"], 40.35)
         self.assertIn("Carnegie Lake", location["place"])
+
+    def test_massachusetts_inventory_resolves_arlington_reservoir(self):
+        response = {
+            "features": [
+                {
+                    "attributes": {"NAME": "Arlington Reservoir"},
+                    "centroid": {"x": -71.1894, "y": 42.4291},
+                },
+                {
+                    "attributes": {"NAME": "Arlington Mill Reservoir"},
+                    "centroid": {"x": -71.2121, "y": 42.8240},
+                },
+            ]
+        }
+        with patch.object(server, "_external_json", return_value=response):
+            matches, error = server._state_waterbody_matches(
+                "Arlington Reservoir", "MA"
+            )
+
+        self.assertIsNone(error)
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["place"], "Arlington Reservoir")
+        self.assertEqual(matches[0]["water_type"], "reservoir")
+        self.assertEqual(matches[0]["provider"], "MassGIS")
+
+    def test_new_hampshire_fishery_inventory_preserves_fishery_metadata(self):
+        response = {
+            "features": [
+                {
+                    "attributes": {
+                        "gnis_name": "Lake Winnipesaukee",
+                        "nhfishery": "Coldwater",
+                        "nhfishnote": "Lake Trout",
+                    },
+                    "centroid": {"x": -71.4, "y": 43.6},
+                }
+            ]
+        }
+        with patch.object(server, "_external_json", return_value=response):
+            matches, error = server._state_waterbody_matches(
+                "Lake Winnipesaukee", "NH"
+            )
+
+        self.assertIsNone(error)
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["water_type"], "lake")
+        self.assertEqual(
+            matches[0]["fishery"],
+            {"category": "Coldwater", "note": "Lake Trout"},
+        )
 
     def test_location_search_rejects_a_result_in_another_state(self):
         candidate = {
@@ -129,6 +193,29 @@ class RecommendationTests(unittest.TestCase):
 
         self.assertEqual(winter, same_conditions)
         self.assertEqual(winter["day"][0]["lure"], "Suspending shad-pattern jerkbait")
+
+    def test_waterbody_type_changes_shore_lures_and_casting_instructions(self):
+        pond = server._recommend_lures("Largemouth Bass", 70, "summer", {}, "pond")
+        reservoir = server._recommend_lures(
+            "Largemouth Bass", 70, "summer", {}, "reservoir"
+        )
+        river = server._recommend_lures("Largemouth Bass", 70, "summer", {}, "river")
+
+        self.assertEqual(pond["day"][0]["lure"], "4-inch green-pumpkin wacky-rigged stick worm")
+        self.assertEqual(reservoir["day"][0]["lure"], "3/8-oz white-and-chartreuse spinnerbait")
+        self.assertEqual(river["day"][0]["lure"], "3/8-oz white spinnerbait")
+        self.assertNotEqual(pond["day"][0]["lure"], reservoir["day"][0]["lure"])
+        self.assertIn("weed edge", pond["day"][0]["how"])
+        self.assertIn("point, cove mouth, or inflow", reservoir["day"][0]["how"])
+        self.assertIn("eddy or current seam", river["day"][0]["how"])
+        self.assertNotEqual(pond["night"][0]["lure"], reservoir["night"][0]["lure"])
+
+    def test_cold_waterbody_type_changes_largemouth_picks(self):
+        pond = server._recommend_lures("Largemouth Bass", 44, "winter", {}, "pond")
+        lake = server._recommend_lures("Largemouth Bass", 44, "winter", {}, "lake")
+
+        self.assertEqual(pond["day"][0]["lure"], "1/8-oz green-pumpkin Ned rig")
+        self.assertEqual(lake["day"][0]["lure"], "3/8-oz suspending shad-pattern jerkbait")
 
     def test_local_weather_is_reduced_to_day_and_night_wind_signals(self):
         zone = ZoneInfo("America/New_York")
@@ -215,6 +302,34 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual([spot["name"] for spot in access["fishing_spots"]], ["Public pier"])
         self.assertEqual(access["parking"][0]["name"], "Lake lot")
         self.assertEqual(access["parking"][0]["access_status"], "Public access mapped")
+
+    def test_massachusetts_access_inventory_adds_state_facilities_and_attribution(self):
+        state_features = [
+            {
+                "attributes": {
+                    "FACNAME": "Arlington Reservoir",
+                    "TOWN": "Lexington",
+                    "RESTRICTED": "No",
+                    "FEE": "No",
+                    "PARKING": "Yes",
+                    "STREET_PERMITED": "No",
+                    "PENDING": "No",
+                },
+                "geometry": {"x": -71.1894, "y": 42.4291},
+            }
+        ]
+        with (
+            patch.object(server, "_arcgis_nearby_features", return_value=state_features),
+            patch.object(server, "_external_json", return_value={"elements": []}),
+        ):
+            access = server._nearby_fishing_access(
+                {"latitude": 42.4291, "longitude": -71.1894}, "MA"
+            )
+
+        self.assertEqual(access["fishing_spots"][0]["name"], "Arlington Reservoir")
+        self.assertEqual(access["parking"][0]["access_status"], "State fishing access")
+        self.assertIn("MassGIS", access["attribution"])
+        self.assertIn("OpenStreetMap", access["attribution"])
 
     def test_usgs_rdb_site_parser_skips_type_row(self):
         text = (

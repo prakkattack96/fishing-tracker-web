@@ -48,6 +48,26 @@ RECOMMENDATION_SPECIES = (
     "Largemouth Bass", "Smallmouth Bass", "Crappie", "Walleye",
     "Northern Pike", "Catfish", "Trout",
 )
+MA_WATER_FEATURES_URL = (
+    "https://services1.arcgis.com/hGdibHYSPO59RG1h/arcgis/rest/services/"
+    "Massachusetts_Water_Features/FeatureServer/8/query"
+)
+MA_FISHING_ACCESS_URL = (
+    "https://services1.arcgis.com/hGdibHYSPO59RG1h/arcgis/rest/services/"
+    "Office_of_Fishing_and_Boating_Access_Sites/FeatureServer/0/query"
+)
+NH_FISHERY_WATER_URL = (
+    "https://nhgeodata.unh.edu/hosting/rest/services/Hosted/EC_NHWAP/"
+    "FeatureServer/6/query"
+)
+NH_WATER_FEATURES_URL = (
+    "https://nhgeodata.unh.edu/hosting/rest/services/Hosted/IWR_WaterResources/"
+    "FeatureServer/9/query"
+)
+NH_FISHING_ACCESS_URL = (
+    "https://services8.arcgis.com/hg1B9Egwk1I5p300/arcgis/rest/services/"
+    "nh_access_sites/FeatureServer/0/query"
+)
 _geocoder_lock = threading.Lock()
 _last_geocoder_request = 0.0
 
@@ -188,7 +208,139 @@ def _nominatim_locations(query: str) -> list:
     return result
 
 
+def _waterbody_tokens(water_body: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", water_body.casefold())
+        if token not in {
+            "lake", "river", "stream", "creek", "brook", "pond",
+            "reservoir", "water", "the",
+        }
+    }
+
+
+def _infer_water_type(name: str, provider_type: str = "") -> str:
+    searchable = f"{name} {provider_type}".casefold()
+    if "reservoir" in searchable:
+        return "reservoir"
+    if any(token in searchable for token in ("stream", "brook", "creek")):
+        return "stream"
+    if "river" in searchable:
+        return "river"
+    if "pond" in searchable:
+        return "pond"
+    if "lake" in searchable or provider_type.casefold() == "water":
+        return "lake"
+    if "canal" in searchable:
+        return "river"
+    return "waterbody"
+
+
+def _state_waterbody_matches(water_body: str, state: str) -> tuple[list[dict], str | None]:
+    query_tokens = _waterbody_tokens(water_body)
+    if not query_tokens or state not in {"MA", "NH"}:
+        return [], None
+    search_token = max(query_tokens, key=len).replace("'", "''")
+    if state == "MA":
+        endpoint = MA_WATER_FEATURES_URL
+        name_field = "NAME"
+        out_fields = "NAME,MINOR_TOT,POLY_CODE,PALIS_ID,SOURCE"
+        source = "MassGIS"
+        queries = [(endpoint, name_field, out_fields, source)]
+    else:
+        queries = [
+            (
+                NH_FISHERY_WATER_URL,
+                "gnis_name",
+                "gnis_name,nhfishery,nhfishnote,acres,maxdepth_m",
+                "New Hampshire Fish and Game",
+            ),
+            (
+                NH_WATER_FEATURES_URL,
+                "gnis_name",
+                "gnis_name,ftype,fcode",
+                "NH GRANIT",
+            ),
+        ]
+    for endpoint, name_field, out_fields, source in queries:
+        try:
+            result = _external_json(
+                endpoint
+                + "?"
+                + urlencode(
+                    {
+                        "where": f"UPPER({name_field}) LIKE '%{search_token.upper()}%'",
+                        "outFields": out_fields,
+                        "returnGeometry": "false",
+                        "returnCentroid": "true",
+                        "outSR": "4326",
+                        "resultRecordCount": 100,
+                        "f": "json",
+                    }
+                ),
+                source,
+            )
+        except DataSourceError:
+            continue
+        features = result.get("features")
+        if not isinstance(features, list):
+            continue
+        matches = []
+        for feature in features:
+            if not isinstance(feature, dict):
+                continue
+            attributes = feature.get("attributes")
+            centroid = feature.get("centroid")
+            if not isinstance(attributes, dict) or not isinstance(centroid, dict):
+                continue
+            name = str(attributes.get(name_field, "")).strip()
+            if not name or query_tokens != _waterbody_tokens(name):
+                continue
+            try:
+                latitude = float(centroid["y"])
+                longitude = float(centroid["x"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            matches.append(
+                {
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "place": name,
+                    "reference": f"{source} waterbody inventory: {name}",
+                    "provider": source,
+                    "site": None,
+                    "water_type": _infer_water_type(
+                        name, str(attributes.get("ftype", ""))
+                    ),
+                    "fishery": {
+                        "category": attributes.get("nhfishery"),
+                        "note": attributes.get("nhfishnote"),
+                    }
+                    if state == "NH" and attributes.get("nhfishery")
+                    else None,
+                }
+            )
+        if matches:
+            return matches, None
+    return [], None
+
+
 def _resolve_named_waterbody(water_body: str, state: str) -> dict:
+    state_matches, _ = _state_waterbody_matches(water_body, state)
+    if state_matches:
+        coordinates = {
+            (match["latitude"], match["longitude"]) for match in state_matches
+        }
+        if len(coordinates) > 1:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"More than one place named “{water_body}” was found in {STATES[state]}. "
+                    "Please include a nearby town or county in the waterbody name."
+                ),
+            )
+        return state_matches[0]
+
     site, site_error = _waterbody_site(water_body, state)
     if site:
         return {
@@ -197,11 +349,16 @@ def _resolve_named_waterbody(water_body: str, state: str) -> dict:
             "place": site["station_nm"],
             "reference": f"USGS site {site['site_no']} ({site['station_nm']})",
             "provider": "USGS",
+            "water_type": _infer_water_type(
+                site["station_nm"],
+                "lake" if site["site_tp_cd"] == "LK" else "river",
+            ),
             "site": {
                 "name": site["station_nm"],
                 "site_type": site["site_tp_cd"],
                 "site_number": site["site_no"],
             },
+            "fishery": None,
         }
 
     query = f"{water_body}, {STATES[state]}, United States"
@@ -217,11 +374,7 @@ def _resolve_named_waterbody(water_body: str, state: str) -> dict:
             ),
         ) from error
 
-    query_tokens = {
-        token
-        for token in re.findall(r"[a-z0-9]+", water_body.casefold())
-        if token not in {"lake", "river", "stream", "creek", "pond", "reservoir", "water"}
-    }
+    query_tokens = _waterbody_tokens(water_body)
     matches = []
     for candidate in candidates:
         if not isinstance(candidate, dict):
@@ -274,6 +427,10 @@ def _resolve_named_waterbody(water_body: str, state: str) -> dict:
                 "reference": f"OpenStreetMap result: {display_name or name or water_body}",
                 "provider": "OpenStreetMap",
                 "site": None,
+                "water_type": _infer_water_type(
+                    water_body, str(candidate.get("type", ""))
+                ),
+                "fishery": None,
             }
         )
     if not matches:
@@ -440,7 +597,55 @@ def _distance_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float
     return 2 * radius * math.asin(min(1, math.sqrt(value)))
 
 
-def _nearby_fishing_access(location: dict) -> dict:
+def _arcgis_nearby_features(
+    endpoint: str,
+    latitude: float,
+    longitude: float,
+    radius_miles: float,
+    where: str,
+    out_fields: str,
+    source: str,
+) -> list[dict]:
+    latitude_delta = radius_miles / 69
+    longitude_delta = radius_miles / max(
+        69 * math.cos(math.radians(latitude)), 1
+    )
+    geometry = json.dumps(
+        {
+            "xmin": longitude - longitude_delta,
+            "ymin": latitude - latitude_delta,
+            "xmax": longitude + longitude_delta,
+            "ymax": latitude + latitude_delta,
+            "spatialReference": {"wkid": 4326},
+        },
+        separators=(",", ":"),
+    )
+    result = _external_json(
+        endpoint
+        + "?"
+        + urlencode(
+            {
+                "where": where,
+                "outFields": out_fields,
+                "returnGeometry": "true",
+                "outSR": "4326",
+                "geometry": geometry,
+                "geometryType": "esriGeometryEnvelope",
+                "inSR": "4326",
+                "spatialRel": "esriSpatialRelIntersects",
+                "resultRecordCount": 100,
+                "f": "json",
+            }
+        ),
+        source,
+    )
+    features = result.get("features")
+    if not isinstance(features, list):
+        raise DataSourceError(source, f"{source} returned unexpected access data.")
+    return features
+
+
+def _nearby_fishing_access(location: dict, state: str = "") -> dict:
     latitude = location["latitude"]
     longitude = location["longitude"]
     radius_meters = 8000
@@ -453,16 +658,143 @@ def _nearby_fishing_access(location: dict) -> dict:
         f'nwr(around:{radius_meters},{latitude},{longitude})["amenity"="parking"];'
         ");out center tags 80;"
     )
+    fishing_spots = []
+    parking = []
+    if state == "MA":
+        try:
+            features = _arcgis_nearby_features(
+                MA_FISHING_ACCESS_URL,
+                latitude,
+                longitude,
+                radius_miles,
+                "1=1",
+                "FACNAME,TOWN,RESTRICTED,FEE,PARKING,STREET_PERMITED,PENDING,COMMENTS",
+                "Massachusetts Office of Fishing and Boating Access",
+            )
+        except DataSourceError as error:
+            raise HTTPException(
+                status_code=502,
+                detail="Massachusetts public fishing-access data is unavailable. Please try again later.",
+            ) from error
+        for feature in features:
+            if not isinstance(feature, dict):
+                continue
+            attributes = feature.get("attributes")
+            geometry = feature.get("geometry")
+            if not isinstance(attributes, dict) or not isinstance(geometry, dict):
+                continue
+            if str(attributes.get("PENDING", "")).casefold() == "yes":
+                continue
+            if str(attributes.get("RESTRICTED", "")).casefold() == "yes":
+                continue
+            try:
+                point_latitude = float(geometry["y"])
+                point_longitude = float(geometry["x"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            distance = _distance_miles(
+                latitude, longitude, point_latitude, point_longitude
+            )
+            if distance > radius_miles:
+                continue
+            permit_required = str(
+                attributes.get("STREET_PERMITED", "")
+            ).casefold() == "yes"
+            fee = str(attributes.get("FEE", "")).strip()
+            status = "State fishing access"
+            rank = 0
+            if permit_required:
+                status = "Street permit required"
+                rank = 1
+            elif fee and fee.casefold() not in {"no", "none"}:
+                status = f"Fee listed: {fee}"
+                rank = 1
+            item = {
+                "name": str(attributes.get("FACNAME") or "Massachusetts fishing access"),
+                "latitude": point_latitude,
+                "longitude": point_longitude,
+                "distance_miles": round(distance, 1),
+                "access_status": status,
+                "source": "Massachusetts Office of Fishing and Boating Access",
+                "_access_rank": rank,
+            }
+            fishing_spots.append(item)
+            if attributes.get("PARKING"):
+                parking.append({**item, "name": f"{item['name']} parking"})
+    elif state == "NH":
+        try:
+            features = _arcgis_nearby_features(
+                NH_FISHING_ACCESS_URL,
+                latitude,
+                longitude,
+                radius_miles,
+                "UPPER(FISH) = 'YES'",
+                "WATER_BODY,FACILITY,OWNERSHIP,ACCESS_TYP,FISH,PARKING_TY,"
+                "SHOREBANK_,FEE,LATITUDE,LONGITUDE",
+                "New Hampshire public-water access dataset",
+            )
+        except DataSourceError as error:
+            raise HTTPException(
+                status_code=502,
+                detail="New Hampshire public fishing-access data is unavailable. Please try again later.",
+            ) from error
+        for feature in features:
+            if not isinstance(feature, dict):
+                continue
+            attributes = feature.get("attributes")
+            geometry = feature.get("geometry")
+            if not isinstance(attributes, dict):
+                continue
+            try:
+                point_latitude = float(
+                    geometry["y"] if isinstance(geometry, dict) else attributes["LATITUDE"]
+                )
+                point_longitude = float(
+                    geometry["x"] if isinstance(geometry, dict) else attributes["LONGITUDE"]
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            distance = _distance_miles(
+                latitude, longitude, point_latitude, point_longitude
+            )
+            if distance > radius_miles:
+                continue
+            fee = str(attributes.get("FEE", "")).strip()
+            status = "Mapped fishing access"
+            rank = 0
+            if fee and fee.casefold() not in {"no", "none"}:
+                status = f"Fee listed: {fee}"
+                rank = 1
+            item = {
+                "name": str(
+                    attributes.get("FACILITY")
+                    or attributes.get("WATER_BODY")
+                    or "New Hampshire fishing access"
+                ),
+                "latitude": point_latitude,
+                "longitude": point_longitude,
+                "distance_miles": round(distance, 1),
+                "access_status": status,
+                "source": "NH Fish and Game / NH GRANIT",
+                "_access_rank": rank,
+            }
+            if str(attributes.get("SHOREBANK_", "")).casefold() in {"y", "yes"}:
+                fishing_spots.append(item)
+            if attributes.get("PARKING_TY"):
+                parking.append({**item, "name": f"{item['name']} parking"})
+
     try:
         result = _external_json(
             "https://overpass-api.de/api/interpreter?" + urlencode({"data": query}),
             "OpenStreetMap",
         )
     except DataSourceError as error:
-        raise HTTPException(
-            status_code=502,
-            detail="Could not load mapped fishing spots and parking. Please try again later.",
-        ) from error
+        if not fishing_spots and not parking:
+            raise HTTPException(
+                status_code=502,
+                detail="Could not load mapped fishing spots and parking. Please try again later.",
+            ) from error
+        result = {"elements": []}
 
     elements = result.get("elements")
     if not isinstance(elements, list):
@@ -471,8 +803,6 @@ def _nearby_fishing_access(location: dict) -> dict:
             detail="Mapped fishing access returned an unexpected response.",
         )
 
-    fishing_spots = []
-    parking = []
     supported_access = {"public", "yes", "permissive", "permit"}
     for element in elements:
         if not isinstance(element, dict):
@@ -531,6 +861,7 @@ def _nearby_fishing_access(location: dict) -> dict:
             "longitude": point_longitude,
             "distance_miles": round(distance, 1),
             "access_status": access_status,
+            "source": "OpenStreetMap",
             "_access_rank": access_rank,
         }
         (fishing_spots if is_fishing else parking).append(point)
@@ -552,6 +883,13 @@ def _nearby_fishing_access(location: dict) -> dict:
         "search_radius_miles": round(radius_miles, 1),
         "fishing_spots": nearest_first(fishing_spots),
         "parking": nearest_first(parking),
+        "attribution": (
+            "MassGIS, Massachusetts Office of Fishing and Boating Access, and OpenStreetMap contributors"
+            if state == "MA"
+            else "NH Fish and Game, NH GRANIT, and OpenStreetMap contributors"
+            if state == "NH"
+            else "OpenStreetMap contributors"
+        ),
     }
 
 
@@ -699,33 +1037,51 @@ def _season_for(month: int) -> str:
     return "fall"
 
 
-def _lure_instruction(lure: str, species: str) -> str:
+def _lure_instruction(lure: str, species: str, water_type: str = "waterbody") -> str:
     name = lure.casefold()
+    cast_areas = {
+        "pond": "the bank-side weed edge",
+        "reservoir": "a point, cove mouth, or inflow",
+        "lake": "a point or windblown shoreline",
+        "river": "an eddy or current seam",
+        "stream": "a riffle-to-current-seam transition",
+    }
+    cast_area = cast_areas.get(water_type, "visible shoreline cover")
     if "slip-sinker" in name:
-        return "Cast just beyond the nearest depth break; let the bait rest on bottom and keep the line slightly slack."
+        return f"Cast near {cast_area}; let the bait rest on bottom and keep the line slightly slack."
     if "bobber" in name or "under a float" in name:
-        return "Cast beside visible brush or a weed edge; let the float settle and drift naturally, adjusting bait depth as needed."
+        return f"Cast beside brush near {cast_area}; let the float drift naturally at the fish's depth."
     if "jerkbait" in name or "minnow-style" in name or "minnow bait" in name:
-        return "Cast parallel to a rocky point or weed edge; retrieve with two twitches, pause, then repeat."
+        return f"Cast parallel to {cast_area}; retrieve with two twitches, pause, then repeat."
     if "frog" in name or "topwater" in name or "buzzbait" in name:
-        return "Cast along the outside edge of shoreline vegetation; walk or buzz it steadily, pausing at open pockets."
+        return f"Cast toward {cast_area}; work it steadily, pausing at openings."
     if "spinnerbait" in name:
-        return "Cast across a shallow point or weed edge; retrieve steadily and slow briefly beside cover."
+        return f"Cast across {cast_area}; retrieve steadily and slow briefly beside cover."
     if "crankbait" in name:
-        return "Cast across a rocky bank or weed edge; retrieve steadily so it bumps cover, then pause."
+        return f"Cast across {cast_area}; retrieve steadily, then pause after it bumps cover."
     if "spoon" in name or "blade bait" in name:
-        return "Cast across a point or current seam; retrieve with short lifts and let it flutter down between them."
+        return f"Cast across {cast_area}; lift briefly and let it flutter down between lifts."
     if "swimbait" in name or "paddletail" in name or "swim jig" in name:
-        return "Cast parallel to a point or weed edge; swim it steadily just above the cover."
+        return f"Cast parallel to {cast_area}; swim it steadily just above the cover."
     if "ned rig" in name or "tube jig" in name or "hair jig" in name or "jig" in name:
-        return "Cast to a rocky edge or visible cover; let it reach bottom, then drag or hop it slowly."
+        return f"Cast near {cast_area}; let it reach bottom, then drag or hop it slowly."
     if "stick worm" in name or "worm" in name:
-        return "Cast beside shade or visible cover; let it sink, then lift it gently and pause."
+        return f"Cast beside shade or cover near {cast_area}; let it sink, then lift gently and pause."
     if "spinner" in name:
-        return "Cast across a current seam or weed edge; retrieve just fast enough to keep the blade turning."
+        return f"Cast across {cast_area}; retrieve just fast enough to keep the blade turning."
     if species.casefold() == "catfish":
-        return "Cast beyond the nearest depth break; keep the bait on bottom and reel in slack without moving it."
-    return "Cast beside visible cover or a shoreline point; retrieve slowly with short pauses."
+        return f"Cast beyond {cast_area}; keep bait on bottom and reel in slack without moving it."
+    return f"Cast near {cast_area}; retrieve slowly with short pauses."
+
+
+def _lure_identity(lure: str) -> str:
+    normalized = re.sub(
+        r"\b\d+(?:/\d+)?-oz\b|\b\d+(?:\.\d+)?-inch\b",
+        "",
+        lure.casefold(),
+    )
+    normalized = re.sub(r"\bfinesse\b", "", normalized)
+    return re.sub(r"[\s-]+", " ", normalized).strip()
 
 
 def _recommend_lures(
@@ -733,6 +1089,7 @@ def _recommend_lures(
     water_temperature_f: float | None,
     season: str,
     weather: dict,
+    water_type: str = "waterbody",
 ) -> dict:
     species = target_species or "Largemouth Bass"
     temp = water_temperature_f
@@ -831,6 +1188,79 @@ def _recommend_lures(
     day_lures = list(profile[temp_band])
     cold_water = (temp is not None and temp < 58) or (temp is None and season == "winter")
     night_lures = list(profile["cold_night"] if cold_water else profile["night"])
+    waterbody_picks = {
+        "pond": {
+            "largemouth bass": ("4-inch green-pumpkin wacky-rigged stick worm", "5-inch black wacky-rigged Senko"),
+            "smallmouth bass": ("2.75-inch green-pumpkin tube on a 1/8-oz jig head", "Black 2.75-inch tube on a 1/8-oz jig head"),
+            "crappie": ("1/16-oz chartreuse jig under a slip bobber", "1/16-oz glow jig under a slip bobber"),
+            "walleye": ("1/8-oz jig tipped with a 3-inch minnow", "Black-and-silver minnow jerkbait"),
+            "northern pike": ("1/4-oz silver spoon with wire leader", "Black 3/8-oz spinnerbait with wire leader"),
+            "catfish": ("Nightcrawler on a 1/4-oz slip-sinker rig", "Cut bait on a 1/2-oz slip-sinker rig"),
+            "trout": ("1/8-oz black-and-gold inline spinner", "1/8-oz black spoon"),
+        },
+        "reservoir": {
+            "largemouth bass": ("3/8-oz white-and-chartreuse spinnerbait", "1/2-oz black Colorado-blade spinnerbait"),
+            "smallmouth bass": ("3-inch shad paddletail on a 1/4-oz jig head", "Black 1/4-oz finesse jig with craw trailer"),
+            "crappie": ("Minnow under a 1/16-oz slip bobber", "Minnow under a lighted slip bobber"),
+            "walleye": ("3/8-oz shad-pattern crankbait", "Black-and-silver minnow jerkbait"),
+            "northern pike": ("3/8-oz spinnerbait with wire leader", "Black 3/8-oz spinnerbait with wire leader"),
+            "catfish": ("Cut bait on a 1/2-oz slip-sinker rig", "Nightcrawler on a 1/2-oz slip-sinker rig"),
+            "trout": ("1/4-oz silver spoon", "1/8-oz black spoon"),
+        },
+        "lake": {
+            "largemouth bass": ("3/8-oz suspending shad-pattern jerkbait", "Black-and-blue 3/8-oz jig with craw trailer"),
+            "smallmouth bass": ("2.75-inch green-pumpkin tube on a 1/8-oz jig head", "Black 1/4-oz finesse jig with craw trailer"),
+            "crappie": ("1/16-oz marabou jig", "Minnow under a lighted slip bobber"),
+            "walleye": ("1/4-oz jig tipped with a minnow", "Black-and-silver minnow jerkbait"),
+            "northern pike": ("1/2-oz silver spoon with wire leader", "Black 3/8-oz spinnerbait with wire leader"),
+            "catfish": ("Cut bait on a 1/2-oz slip-sinker rig", "Nightcrawler on a 1/2-oz slip-sinker rig"),
+            "trout": ("1/4-oz silver spoon", "1/8-oz black spoon"),
+        },
+        "river": {
+            "largemouth bass": ("3/8-oz white spinnerbait", "Black 1/4-oz spinnerbait"),
+            "smallmouth bass": ("1/8-oz green-pumpkin tube jig", "Black 1/8-oz hair jig"),
+            "crappie": ("1/16-oz jig under a slip bobber", "1/16-oz glow jig under a slip bobber"),
+            "walleye": ("1/4-oz jig tipped with a minnow", "Black-and-silver minnow jerkbait"),
+            "northern pike": ("1/2-oz spoon with wire leader", "Black 3/8-oz spinnerbait with wire leader"),
+            "catfish": ("Cut bait on a 1/2-oz slip-sinker rig", "Nightcrawler on a 1/2-oz slip-sinker rig"),
+            "trout": ("1/8-oz copper inline spinner", "1/8-oz black inline spinner"),
+        },
+        "stream": {
+            "largemouth bass": ("1/4-oz white spinnerbait", "Black 1/8-oz tube jig"),
+            "smallmouth bass": ("1/8-oz green-pumpkin tube jig", "Black 1/8-oz hair jig"),
+            "crappie": ("1/32-oz jig under a slip bobber", "1/32-oz glow jig under a slip bobber"),
+            "walleye": ("1/8-oz jig tipped with a minnow", "Black-and-silver minnow jerkbait"),
+            "northern pike": ("1/4-oz spoon with wire leader", "Black 1/4-oz spinnerbait with wire leader"),
+            "catfish": ("Nightcrawler on a 1/4-oz slip-sinker rig", "Cut bait on a 1/4-oz slip-sinker rig"),
+            "trout": ("1/8-oz copper inline spinner", "1/8-oz black inline spinner"),
+        },
+    }
+    water_picks = waterbody_picks.get(water_type, {}).get(key)
+    if water_picks:
+        day_pick, night_pick = water_picks
+        if cold_water and key == "largemouth bass":
+            day_pick = {
+                "pond": "1/8-oz green-pumpkin Ned rig",
+                "reservoir": "3/8-oz suspending shad-pattern jerkbait",
+                "lake": "3/8-oz suspending shad-pattern jerkbait",
+                "river": "1/4-oz black-and-blue jig with craw trailer",
+                "stream": "1/8-oz green-pumpkin Ned rig",
+            }.get(water_type, day_pick)
+            night_pick = {
+                "pond": "Black-and-blue 3/8-oz finesse jig with craw trailer",
+                "reservoir": "Black-and-blue 3/8-oz finesse jig with craw trailer",
+                "lake": "Black-and-blue 3/8-oz jig with craw trailer",
+                "river": "Black 1/4-oz finesse jig with craw trailer",
+                "stream": "Black 1/8-oz tube jig",
+            }.get(water_type, night_pick)
+        day_identity = _lure_identity(day_pick)
+        night_identity = _lure_identity(night_pick)
+        day_lures = [
+            day_pick
+        ] + [lure for lure in day_lures if _lure_identity(lure) != day_identity]
+        night_lures = [
+            night_pick
+        ] + [lure for lure in night_lures if _lure_identity(lure) != night_identity]
     daytime = weather.get("daytime") or {}
     day_wind = daytime.get("maximum_wind_mph")
     if isinstance(day_wind, (int, float)) and day_wind >= 10:
@@ -854,6 +1284,8 @@ def _recommend_lures(
         )
         if moving_lure is not None:
             day_lures.insert(0, day_lures.pop(moving_lure))
+    day_lures = day_lures[:3]
+    night_lures = night_lures[:3]
     if temp is None:
         basis = f"Seasonal picks for {species}; no recent nearby water-temperature reading."
     else:
@@ -865,7 +1297,7 @@ def _recommend_lures(
             {
                 "rank": index + 1,
                 "lure": lure,
-                "how": _lure_instruction(lure, species),
+                "how": _lure_instruction(lure, species, water_type),
             }
             for index, lure in enumerate(day_lures)
         ],
@@ -873,7 +1305,7 @@ def _recommend_lures(
             {
                 "rank": index + 1,
                 "lure": lure,
-                "how": _lure_instruction(lure, species),
+                "how": _lure_instruction(lure, species, water_type),
             }
             for index, lure in enumerate(night_lures)
         ],
@@ -909,11 +1341,16 @@ def build_recommendation_report(payload: RecommendationRequest) -> dict:
     temp = water_temperature.get("temperature_f")
     season = _season_for(local_now.month)
     moon = _moon_phase(local_now)
-    recommendations = _recommend_lures(target_species, temp, season, weather)
-    access = _nearby_fishing_access(location)
+    water_type = location.get("water_type", "waterbody")
+    recommendations = _recommend_lures(
+        target_species, temp, season, weather, water_type
+    )
+    access = _nearby_fishing_access(location, state)
     return {
         "water_body": water_body,
         "state": {"code": state, "name": STATES[state]},
+        "water_type": water_type,
+        "fishery": location.get("fishery"),
         "local_date": local_now.date().isoformat(),
         "season": season,
         "moon": moon,

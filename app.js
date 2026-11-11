@@ -615,15 +615,20 @@ function renderRecommendationReport(report) {
 
   const heading = reportElement("h2", "", `${report.water_body} · ${report.state.name}`);
   const water = report.water_temperature;
+  const waterTypeKey = report.water_type || "waterbody";
+  const waterType = waterTypeKey === "waterbody"
+    ? "Waterbody"
+    : `${waterTypeKey[0].toUpperCase()}${waterTypeKey.slice(1)}`;
   const introText = water.available
-    ? `${report.recommendations.species} · ${water.temperature_f}°F nearby water reading · ${report.season}`
-    : `${report.recommendations.species} · seasonal picks · ${report.season}`;
+    ? `${report.recommendations.species} · ${waterType} · ${water.temperature_f}°F nearby water reading · ${report.season}`
+    : `${report.recommendations.species} · ${waterType} · seasonal picks · ${report.season}`;
   const intro = reportElement("p", "muted", introText);
   const overview = reportElement("section", "panel recommendation-overview");
   overview.append(heading, intro);
 
   const overviewGrid = reportElement("div", "report-facts");
   const facts = [
+    ["Water type", waterType],
     [
       "Water temperature",
       water.available
@@ -632,6 +637,10 @@ function renderRecommendationReport(report) {
     ],
     ["Moon", report.moon.phase]
   ];
+  const fisheryDetails = report.fishery
+    ? [report.fishery.category, report.fishery.note].filter(Boolean).join(" · ")
+    : "";
+  if (fisheryDetails) facts.push(["Mapped state fishery", fisheryDetails]);
   for (const [label, value] of facts) {
     const fact = reportElement("article", "report-fact");
     fact.append(reportElement("strong", "", label), reportElement("span", "", value));
@@ -697,12 +706,13 @@ function renderRecommendationReport(report) {
   access.append(broaderSearch);
   const attribution = document.createElement("small");
   attribution.className = "map-attribution";
+  attribution.append(`Access data: ${report.access.attribution || "OpenStreetMap contributors"}. `);
   const attributionLink = document.createElement("a");
   attributionLink.href = "https://www.openstreetmap.org/copyright";
   attributionLink.target = "_blank";
   attributionLink.rel = "noopener noreferrer";
-  attributionLink.textContent = "© OpenStreetMap contributors";
-  attribution.append("Map data ", attributionLink);
+  attributionLink.textContent = "OpenStreetMap copyright terms";
+  attribution.append(attributionLink);
   access.append(attribution);
 
   container.append(overview, lureGrid, access);

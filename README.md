@@ -6,32 +6,32 @@ The **Shore lure guide** tab creates separate day and night lure lists for a
 named waterbody, state, and optional target fish. No ZIP code is needed.
 Leaving the fish blank gives bass-first suggestions. It uses:
 
-- A matching USGS site, or OpenStreetMap geocoding when a matching USGS site
-  cannot be found, to locate the named waterbody within the selected state.
+- Official Massachusetts (MassGIS) and New Hampshire (Fish and Game / GRANIT)
+  waterbody inventories before falling back to USGS and OpenStreetMap name
+  matching. The report identifies the inferred type (pond, lake, reservoir,
+  river, or stream); Massachusetts hydrography alone does not establish public
+  fishing access.
 - USGS Water Data for a recent nearby water-temperature reading when available.
 - The National Weather Service hourly forecast to determine local time and
   wind influence on lure ranking. Forecast details are not shown in the report.
-- OpenStreetMap map features tagged for fishing and parking within about five
-  miles, ranked by mapped access status and distance. Each result links to its
-  coordinates in Google Maps. Locations are included only when map tags mark
-  access as public/unrestricted or permit-required; unknown and restricted
-  access is not recommended.
-- Seasonal and water-temperature lure profiles, with a short cast-and-retrieve
-  instruction for each pick.
+- Official Massachusetts and New Hampshire public-access datasets, plus
+  OpenStreetMap features tagged for fishing and parking, within about five
+  miles. Results link to Google Maps and show their mapped access status.
+- Seasonal and water-temperature lure profiles with waterbody-specific
+  day/night picks and short shore-casting instructions.
 
-The lure profiles are general seasonal/temperature guidance, not a live scrape
-of fishing reports, local catch data, or a guarantee. Map listings are
-OpenStreetMap features and may be incomplete or out of date; map tags do not
-guarantee on-site conditions. The report labels permit-required locations and
-does not suggest locations whose access status is unknown or restricted. Follow posted access and parking restrictions. The report
-does not claim to search every online source or verify current on-site
-conditions. Ambiguous waterbody names are rejected rather than silently
-selecting the wrong location.
+Lure picks are rule-based seasonal, temperature, species, and habitat guidance,
+not a live scrape of fishing reports or local catch data and not a guarantee.
+Map and state inventory listings may be incomplete or out of date; mapped
+access does not guarantee current permission or on-site conditions. Follow
+posted access and parking restrictions. Ambiguous waterbody names are rejected
+rather than silently selecting the wrong location.
 
 The recommendation endpoint uses free public services and does not require the
 OpenAI key or a signed-in catch account. It does require the server to have
-internet access to OpenStreetMap, Overpass, National Weather Service, and USGS.
-OpenStreetMap map data is attributed in the access section.
+internet access to MassGIS and NH GRANIT/Fish and Game (where applicable),
+OpenStreetMap, Overpass, National Weather Service, and USGS. Access data
+attribution and the OpenStreetMap copyright link appear in the report.
 
 This is the phone-friendly, installable web app with a Supabase-backed catch
 log. The Tkinter desktop app is a separate client for now and has not been
