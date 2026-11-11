@@ -103,6 +103,58 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(location["latitude"], 40.35)
         self.assertIn("Carnegie Lake", location["place"])
 
+    def test_town_qualifier_resolves_duplicate_openstreetmap_results(self):
+        candidates = [
+            {
+                "lat": "40.35",
+                "lon": "-74.66",
+                "name": "Lake Example",
+                "display_name": "Lake Example, Princeton, New Jersey, United States",
+                "type": "lake",
+                "address": {
+                    "town": "Princeton",
+                    "state": "New Jersey",
+                    "ISO3166-2-lvl4": "US-NJ",
+                },
+            },
+            {
+                "lat": "40.72",
+                "lon": "-74.60",
+                "name": "Lake Example",
+                "display_name": "Lake Example, Princeton, New Jersey, United States",
+                "type": "lake",
+                "address": {
+                    "town": "Princeton",
+                    "state": "New Jersey",
+                    "ISO3166-2-lvl4": "US-NJ",
+                },
+            },
+        ]
+        locality = {
+            "lat": "40.35",
+            "lon": "-74.66",
+            "address": {
+                "town": "Princeton",
+                "state": "New Jersey",
+                "ISO3166-2-lvl4": "US-NJ",
+            },
+        }
+        with (
+            patch.object(server, "_waterbody_site", return_value=(None, None)),
+            patch.object(
+                server,
+                "_nominatim_locations",
+                side_effect=[candidates, [locality]],
+            ),
+        ):
+            location = server._resolve_named_waterbody(
+                "Lake Example, Princeton", "NJ"
+            )
+
+        self.assertEqual(location["provider"], "OpenStreetMap")
+        self.assertEqual(location["latitude"], 40.35)
+        self.assertNotIn("_candidate_name", location)
+
     def test_massachusetts_inventory_resolves_arlington_reservoir(self):
         response = {
             "features": [
@@ -113,6 +165,10 @@ class RecommendationTests(unittest.TestCase):
                 {
                     "attributes": {"NAME": "Arlington Mill Reservoir"},
                     "centroid": {"x": -71.2121, "y": 42.8240},
+                },
+                {
+                    "attributes": {"NAME": "Arlington Pond"},
+                    "centroid": {"x": -71.10, "y": 42.50},
                 },
             ]
         }
@@ -126,6 +182,78 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(matches[0]["place"], "Arlington Reservoir")
         self.assertEqual(matches[0]["water_type"], "reservoir")
         self.assertEqual(matches[0]["provider"], "MassGIS")
+
+    def test_state_inventory_matches_waterbody_when_town_is_appended(self):
+        response = {
+            "features": [
+                {
+                    "attributes": {"NAME": "Arlington Reservoir"},
+                    "centroid": {"x": -71.1894, "y": 42.4291},
+                }
+            ]
+        }
+        with patch.object(server, "_external_json", return_value=response):
+            matches, error = server._state_waterbody_matches(
+                "Arlington Reservoir, Lexington", "MA"
+            )
+
+        self.assertIsNone(error)
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["place"], "Arlington Reservoir")
+
+    def test_town_qualifier_resolves_duplicate_waterbody_names(self):
+        matches = [
+            {
+                "latitude": 42.4291,
+                "longitude": -71.1894,
+                "place": "Arlington Reservoir",
+                "provider": "MassGIS",
+                "water_type": "reservoir",
+            },
+            {
+                "latitude": 42.60,
+                "longitude": -71.40,
+                "place": "Arlington Reservoir",
+                "provider": "MassGIS",
+                "water_type": "reservoir",
+            },
+        ]
+        candidate = {
+            "lat": "42.4291",
+            "lon": "-71.1894",
+            "name": "Arlington Reservoir",
+            "display_name": (
+                "Arlington Reservoir, Lexington, Middlesex County, "
+                "Massachusetts, United States"
+            ),
+            "type": "reservoir",
+            "address": {
+                "town": "Lexington",
+                "state": "Massachusetts",
+                "ISO3166-2-lvl4": "US-MA",
+            },
+        }
+        with (
+            patch.object(server, "_state_waterbody_matches", return_value=(matches, None)),
+            patch.object(server, "_nominatim_locations", return_value=[candidate]),
+        ):
+            location = server._resolve_named_waterbody(
+                "Arlington Reservoir, Lexington", "MA"
+            )
+
+        self.assertEqual(location["provider"], "MassGIS")
+        self.assertAlmostEqual(location["latitude"], 42.4291)
+
+    def test_duplicate_waterbody_without_town_still_requests_clarification(self):
+        matches = [
+            {"latitude": 42.0, "longitude": -71.0, "place": "Long Pond"},
+            {"latitude": 43.0, "longitude": -72.0, "place": "Long Pond"},
+        ]
+        with patch.object(server, "_state_waterbody_matches", return_value=(matches, None)):
+            with self.assertRaises(HTTPException) as raised:
+                server._resolve_named_waterbody("Long Pond", "MA")
+
+        self.assertIn("nearby town or county", raised.exception.detail)
 
     def test_new_hampshire_fishery_inventory_preserves_fishery_metadata(self):
         response = {

@@ -214,9 +214,27 @@ def _waterbody_tokens(water_body: str) -> set[str]:
         for token in re.findall(r"[a-z0-9]+", water_body.casefold())
         if token not in {
             "lake", "river", "stream", "creek", "brook", "pond",
-            "reservoir", "water", "the",
+            "reservoir", "water", "the", "in", "near", "at", "by",
         }
     }
+
+
+def _waterbody_name_tokens(water_body: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", water_body.casefold())
+        if token not in {"the", "in", "near", "at", "by"}
+    }
+
+
+def _waterbody_query_parts(water_body: str) -> tuple[set[str], set[str]]:
+    match = re.search(r",|\b(?:in|near|at)\b", water_body, re.IGNORECASE)
+    if not match:
+        return _waterbody_name_tokens(water_body), set()
+    return (
+        _waterbody_name_tokens(water_body[:match.start()]),
+        _waterbody_name_tokens(water_body[match.end():]),
+    )
 
 
 def _infer_water_type(name: str, provider_type: str = "") -> str:
@@ -237,10 +255,10 @@ def _infer_water_type(name: str, provider_type: str = "") -> str:
 
 
 def _state_waterbody_matches(water_body: str, state: str) -> tuple[list[dict], str | None]:
-    query_tokens = _waterbody_tokens(water_body)
-    if not query_tokens or state not in {"MA", "NH"}:
+    waterbody_tokens, _ = _waterbody_query_parts(water_body)
+    if not waterbody_tokens or state not in {"MA", "NH"}:
         return [], None
-    search_token = max(query_tokens, key=len).replace("'", "''")
+    search_tokens = sorted(waterbody_tokens, key=lambda token: (-len(token), token))
     if state == "MA":
         endpoint = MA_WATER_FEATURES_URL
         name_field = "NAME"
@@ -263,75 +281,234 @@ def _state_waterbody_matches(water_body: str, state: str) -> tuple[list[dict], s
             ),
         ]
     for endpoint, name_field, out_fields, source in queries:
-        try:
-            result = _external_json(
-                endpoint
-                + "?"
-                + urlencode(
-                    {
-                        "where": f"UPPER({name_field}) LIKE '%{search_token.upper()}%'",
-                        "outFields": out_fields,
-                        "returnGeometry": "false",
-                        "returnCentroid": "true",
-                        "outSR": "4326",
-                        "resultRecordCount": 100,
-                        "f": "json",
-                    }
-                ),
-                source,
-            )
-        except DataSourceError:
-            continue
-        features = result.get("features")
-        if not isinstance(features, list):
-            continue
-        matches = []
-        for feature in features:
-            if not isinstance(feature, dict):
-                continue
-            attributes = feature.get("attributes")
-            centroid = feature.get("centroid")
-            if not isinstance(attributes, dict) or not isinstance(centroid, dict):
-                continue
-            name = str(attributes.get(name_field, "")).strip()
-            if not name or query_tokens != _waterbody_tokens(name):
-                continue
+        for search_token in search_tokens:
             try:
-                latitude = float(centroid["y"])
-                longitude = float(centroid["x"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            matches.append(
-                {
-                    "latitude": latitude,
-                    "longitude": longitude,
-                    "place": name,
-                    "reference": f"{source} waterbody inventory: {name}",
-                    "provider": source,
-                    "site": None,
-                    "water_type": _infer_water_type(
-                        name, str(attributes.get("ftype", ""))
+                result = _external_json(
+                    endpoint
+                    + "?"
+                    + urlencode(
+                        {
+                            "where": f"UPPER({name_field}) LIKE '%{search_token.upper()}%'",
+                            "outFields": out_fields,
+                            "returnGeometry": "false",
+                            "returnCentroid": "true",
+                            "outSR": "4326",
+                            "resultRecordCount": 100,
+                            "f": "json",
+                        }
                     ),
-                    "fishery": {
-                        "category": attributes.get("nhfishery"),
-                        "note": attributes.get("nhfishnote"),
+                    source,
+                )
+            except DataSourceError:
+                break
+            features = result.get("features")
+            if not isinstance(features, list):
+                continue
+            matches = []
+            for feature in features:
+                if not isinstance(feature, dict):
+                    continue
+                attributes = feature.get("attributes")
+                centroid = feature.get("centroid")
+                if not isinstance(attributes, dict) or not isinstance(centroid, dict):
+                    continue
+                name = str(attributes.get(name_field, "")).strip()
+                name_tokens = _waterbody_name_tokens(name)
+                if (
+                    not name
+                    or not name_tokens
+                    or not name_tokens.issubset(waterbody_tokens)
+                ):
+                    continue
+                try:
+                    latitude = float(centroid["y"])
+                    longitude = float(centroid["x"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                matches.append(
+                    {
+                        "latitude": latitude,
+                        "longitude": longitude,
+                        "place": name,
+                        "reference": f"{source} waterbody inventory: {name}",
+                        "provider": source,
+                        "site": None,
+                        "water_type": _infer_water_type(
+                            name, str(attributes.get("ftype", ""))
+                        ),
+                        "fishery": {
+                            "category": attributes.get("nhfishery"),
+                            "note": attributes.get("nhfishnote"),
+                        }
+                        if state == "NH" and attributes.get("nhfishery")
+                        else None,
                     }
-                    if state == "NH" and attributes.get("nhfishery")
-                    else None,
-                }
-            )
-        if matches:
-            return matches, None
+                )
+            if matches:
+                return matches, None
     return [], None
+
+
+def _disambiguate_state_waterbody_matches(
+    matches: list[dict], water_body: str, state: str
+) -> dict | None:
+    if not matches:
+        return None
+
+    unique_matches = []
+    for match in matches:
+        if not any(
+            _distance_miles(
+                match["latitude"],
+                match["longitude"],
+                existing["latitude"],
+                existing["longitude"],
+            )
+            < 0.1
+            for existing in unique_matches
+        ):
+            unique_matches.append(match)
+    if len(unique_matches) == 1:
+        return unique_matches[0]
+
+    query_tokens = _waterbody_name_tokens(water_body)
+    name_tokens = _waterbody_name_tokens(unique_matches[0]["place"])
+    _, explicit_locality_tokens = _waterbody_query_parts(water_body)
+    locality_tokens = explicit_locality_tokens or query_tokens - name_tokens
+    if not locality_tokens:
+        return None
+
+    state_name = STATES[state]
+    query = f"{water_body}, {state_name}, United States"
+    try:
+        candidates = _nominatim_locations(query)
+    except DataSourceError:
+        candidates = []
+
+    water_types = {
+        "bay", "canal", "coastline", "creek", "lake", "lagoon", "pond",
+        "reservoir", "river", "riverbank", "stream", "water", "wetland",
+    }
+    located_candidates = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        address = candidate.get("address")
+        if not isinstance(address, dict):
+            continue
+        candidate_state = str(address.get("state", "")).casefold()
+        state_code = str(address.get("ISO3166-2-lvl4", "")).split("-")[-1].upper()
+        if candidate_state != state_name.casefold() and state_code != state:
+            continue
+        searchable = (
+            f"{candidate.get('name', '')} {candidate.get('display_name', '')}"
+        ).casefold()
+        candidate_tokens = set(re.findall(r"[a-z0-9]+", searchable))
+        if not name_tokens.issubset(candidate_tokens):
+            continue
+        address_tokens = set(
+            re.findall(
+                r"[a-z0-9]+",
+                " ".join(str(value) for value in address.values()).casefold(),
+            )
+        )
+        if not locality_tokens.issubset(candidate_tokens | address_tokens):
+            continue
+        if str(candidate.get("type", "")).casefold() not in water_types:
+            continue
+        try:
+            latitude = float(candidate["lat"])
+            longitude = float(candidate["lon"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        located_candidates.append((latitude, longitude, candidate))
+
+    if located_candidates:
+        ranked_matches = []
+        for match in unique_matches:
+            nearest_distance = min(
+                _distance_miles(
+                    match["latitude"],
+                    match["longitude"],
+                    latitude,
+                    longitude,
+                )
+                for latitude, longitude, _ in located_candidates
+            )
+            ranked_matches.append((nearest_distance, match))
+        ranked_matches.sort(key=lambda result: result[0])
+        if (
+            ranked_matches[0][0] <= 5
+            and (
+                len(ranked_matches) == 1
+                or ranked_matches[1][0] - ranked_matches[0][0] >= 0.1
+            )
+        ):
+            return ranked_matches[0][1]
+
+    locality = " ".join(
+        token for token in re.findall(r"[a-z0-9]+", water_body.casefold())
+        if token in locality_tokens
+    )
+    try:
+        localities = _nominatim_locations(
+            f"{locality}, {state_name}, United States"
+        )
+    except DataSourceError:
+        return None
+    for candidate in localities:
+        if not isinstance(candidate, dict):
+            continue
+        address = candidate.get("address")
+        if not isinstance(address, dict):
+            continue
+        candidate_state = str(address.get("state", "")).casefold()
+        state_code = str(address.get("ISO3166-2-lvl4", "")).split("-")[-1].upper()
+        if candidate_state != state_name.casefold() and state_code != state:
+            continue
+        try:
+            latitude = float(candidate["lat"])
+            longitude = float(candidate["lon"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        ranked_matches = sorted(
+            [
+                (
+                    _distance_miles(
+                        match["latitude"],
+                        match["longitude"],
+                        latitude,
+                        longitude,
+                    ),
+                    match,
+                )
+                for match in unique_matches
+            ],
+            key=lambda result: result[0],
+        )
+        if (
+            ranked_matches[0][0] <= 25
+            and (
+                len(ranked_matches) == 1
+                or ranked_matches[1][0] - ranked_matches[0][0] >= 1
+            )
+        ):
+            return ranked_matches[0][1]
+    return None
 
 
 def _resolve_named_waterbody(water_body: str, state: str) -> dict:
     state_matches, _ = _state_waterbody_matches(water_body, state)
     if state_matches:
-        coordinates = {
-            (match["latitude"], match["longitude"]) for match in state_matches
-        }
-        if len(coordinates) > 1:
+        location = _disambiguate_state_waterbody_matches(
+            state_matches, water_body, state
+        )
+        if location:
+            return location
+        if len(state_matches) > 1 and not (
+            _waterbody_name_tokens(water_body)
+            - _waterbody_name_tokens(state_matches[0]["place"])
+        ):
             raise HTTPException(
                 status_code=422,
                 detail=(
@@ -339,7 +516,8 @@ def _resolve_named_waterbody(water_body: str, state: str) -> dict:
                     "Please include a nearby town or county in the waterbody name."
                 ),
             )
-        return state_matches[0]
+        if len(state_matches) == 1:
+            return state_matches[0]
 
     site, site_error = _waterbody_site(water_body, state)
     if site:
@@ -431,6 +609,7 @@ def _resolve_named_waterbody(water_body: str, state: str) -> dict:
                     water_body, str(candidate.get("type", ""))
                 ),
                 "fishery": None,
+                "_candidate_name": name,
             }
         )
     if not matches:
@@ -446,19 +625,96 @@ def _resolve_named_waterbody(water_body: str, state: str) -> dict:
                 f"{detail}Try a more specific waterbody name."
             ),
         )
-    if len(matches) > 1:
-        coordinates = {
-            (match["latitude"], match["longitude"]) for match in matches
-        }
-        if len(coordinates) > 1:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"More than one place named “{water_body}” was found in {STATES[state]}. "
-                    "Please include a nearby town or county in the waterbody name."
-                ),
+    unique_matches = []
+    for match in matches:
+        if not any(
+            _distance_miles(
+                match["latitude"],
+                match["longitude"],
+                existing["latitude"],
+                existing["longitude"],
             )
-    return matches[0]
+            < 0.1
+            for existing in unique_matches
+        ):
+            unique_matches.append(match)
+
+    locality_tokens = _waterbody_query_parts(water_body)[1]
+    if unique_matches:
+        locality_tokens = locality_tokens or (
+            _waterbody_name_tokens(water_body)
+            - _waterbody_name_tokens(unique_matches[0]["_candidate_name"])
+        )
+    locality = ""
+    if len(unique_matches) > 1 and locality_tokens:
+        locality = " ".join(
+            token for token in re.findall(r"[a-z0-9]+", water_body.casefold())
+            if token in locality_tokens
+        )
+        try:
+            localities = _nominatim_locations(
+                f"{locality}, {STATES[state]}, United States"
+            )
+        except DataSourceError:
+            localities = []
+        for candidate in localities:
+            if not isinstance(candidate, dict):
+                continue
+            address = candidate.get("address")
+            if not isinstance(address, dict):
+                continue
+            candidate_state = str(address.get("state", "")).casefold()
+            state_code = str(address.get("ISO3166-2-lvl4", "")).split("-")[-1].upper()
+            if candidate_state != STATES[state].casefold() and state_code != state:
+                continue
+            try:
+                latitude = float(candidate["lat"])
+                longitude = float(candidate["lon"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            ranked_matches = sorted(
+                [
+                    (
+                        _distance_miles(
+                            match["latitude"],
+                            match["longitude"],
+                            latitude,
+                            longitude,
+                        ),
+                        match,
+                    )
+                    for match in unique_matches
+                ],
+                key=lambda result: result[0],
+            )
+            if (
+                ranked_matches[0][0] <= 25
+                and ranked_matches[1][0] - ranked_matches[0][0] >= 1
+            ):
+                return {
+                    key: value
+                    for key, value in ranked_matches[0][1].items()
+                    if not key.startswith("_")
+                }
+
+    if len(unique_matches) > 1:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"More than one place named “{water_body}” was found in {STATES[state]}. "
+                + (
+                    f"“{locality}” did not identify a single location. "
+                    "Try adding a county or nearby landmark."
+                    if locality_tokens
+                    else "Please include a nearby town or county in the waterbody name."
+                )
+            ),
+        )
+    return {
+        key: value
+        for key, value in unique_matches[0].items()
+        if not key.startswith("_")
+    }
 
 
 def _local_time_and_wind(location: dict) -> tuple[str, datetime, dict]:

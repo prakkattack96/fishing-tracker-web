@@ -4,7 +4,9 @@
 
 The **Shore lure guide** tab creates separate day and night lure lists for a
 named waterbody, state, and optional target fish. No ZIP code is needed.
-Leaving the fish blank gives bass-first suggestions. It uses:
+For duplicate waterbody names, add the town after a comma (for example,
+`Long Pond, Plymouth`). Leaving the fish blank gives bass-first suggestions.
+It uses:
 
 - Official Massachusetts (MassGIS) and New Hampshire (Fish and Game / GRANIT)
   waterbody inventories before falling back to USGS and OpenStreetMap name
