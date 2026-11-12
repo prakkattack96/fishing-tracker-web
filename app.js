@@ -640,16 +640,53 @@ function renderRecommendationMap(report) {
     ));
   }
   if (mapData.bathymetry?.available) {
-    const unitNote = mapData.bathymetry.unit
-      ? ` in ${mapData.bathymetry.unit}`
-      : " (units are not specified by the source layer)";
+    const bathymetry = mapData.bathymetry;
+    const depthRange = Number.isFinite(bathymetry.min_depth) && Number.isFinite(bathymetry.max_depth)
+      ? ` ${bathymetry.min_depth}–${bathymetry.max_depth} ${bathymetry.unit} deep`
+      : "";
+    const interval = Number.isFinite(bathymetry.depth_interval_ft)
+      ? `; about ${bathymetry.depth_interval_ft} ft between mapped depths`
+      : "";
     section.append(reportElement(
       "p",
       "muted small",
-      `${mapData.bathymetry.contours.length} published depth contours shown${unitNote}.`
+      `${bathymetry.contours.length} published depth contours shown${depthRange}${interval}. Toggle “Depth contours” on the map; these interpolated lines are not depth readings at the shore pins.`
     ));
   } else if (mapData.bathymetry?.message) {
     section.append(reportElement("p", "muted small", mapData.bathymetry.message));
+    if (mapData.bathymetry.source_info_url) {
+      const sourceLink = document.createElement("a");
+      sourceLink.href = mapData.bathymetry.source_info_url;
+      sourceLink.target = "_blank";
+      sourceLink.rel = "noopener noreferrer";
+      sourceLink.textContent = "Open the official depth-data page";
+      section.append(sourceLink);
+    }
+  }
+  const depthGuidance = mapData.depth_guidance;
+  if (depthGuidance) {
+    const currentPeriod = depthGuidance.local_period
+      ? ` Current local period: ${depthGuidance.local_period}.`
+      : " Current day/night period was unavailable.";
+    section.append(reportElement(
+      "p",
+      "muted small",
+      `Depth ranking for ${depthGuidance.species || "the selected species"} in ${depthGuidance.season || "the current season"} (${depthGuidance.confidence.toLowerCase()} confidence). ${depthGuidance.behavior_note}${currentPeriod}`
+    ));
+    if (depthGuidance.water_temperature) {
+      section.append(reportElement(
+        "p",
+        "muted small",
+        `Nearest recent water-temperature reading: ${depthGuidance.water_temperature.temperature_f}°F, ${depthGuidance.water_temperature.distance_miles} mi away; context only, not a reading at this waterbody.`
+      ));
+    }
+    if (depthGuidance.limitations?.length) {
+      section.append(reportElement(
+        "p",
+        "muted small",
+        `Limits: ${depthGuidance.limitations.join(" ")}`
+      ));
+    }
   }
   if (!mapData.shoreline_spots?.length) {
     section.append(reportElement(
@@ -669,6 +706,15 @@ function renderRecommendationMap(report) {
   if (mapData.bathymetry?.source_url) {
     sources.push([mapData.bathymetry.source, mapData.bathymetry.source_url]);
   }
+  if (
+    mapData.bathymetry?.source_info_url
+    && mapData.bathymetry.source_info_url !== mapData.bathymetry.source_url
+  ) {
+    sources.push(["Depth-data documentation", mapData.bathymetry.source_info_url]);
+  }
+  for (const source of depthGuidance?.sources || []) {
+    sources.push([source.title, source.url]);
+  }
   for (const source of mapData.access_sources || []) {
     sources.push([source.name, source.url]);
   }
@@ -682,6 +728,13 @@ function renderRecommendationMap(report) {
     attribution.append(link);
   });
   if (sources.length) section.append(attribution);
+  if (mapData.bathymetry?.attribution) {
+    section.append(reportElement(
+      "small",
+      "map-attribution",
+      mapData.bathymetry.attribution
+    ));
+  }
   return { section, map, mapData };
 }
 

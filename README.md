@@ -21,8 +21,10 @@ It uses:
   fishing facts.
 - A satellite map from Esri, a state waterbody outline when available, and
   official Massachusetts or New Hampshire bathymetric contours when available.
-  New Hampshire contour metadata specifies feet; the Massachusetts service
-  does not specify the depth unit in its layer metadata.
+  Massachusetts contour depths are in feet. The app matches mapped MassGIS
+  waterbodies by `PALIS_ID`, excludes shoreline/island lines, and exposes the
+  available contour-depth range and interval. The interactive contour overlay
+  remains on the existing map.
 - Seasonal and nearby-water-temperature lure profiles with specific sizes,
   rigging, retrieval, shore habitat, rationale, and a backup presentation.
 - Public shoreline-access pins only when the state or OpenStreetMap record
@@ -43,6 +45,37 @@ measurement at the selected fishing spot. Forage, water clarity, submerged
 vegetation, substrate, local species occurrence, and current access conditions
 are not consistently available and are not invented. Ambiguous waterbody names
 are rejected rather than silently selecting the wrong location.
+
+### Bathymetry-aware shore pins
+
+When Massachusetts contours are available, the app uses the matched
+waterbody's `PALIS_ID` rather than mixing same-named ponds, filters out
+`SHORE=1` and zero-depth shoreline records, and reports mapped depths in feet.
+A pin is ranked using nearby contour structure, wind direction, and a
+deliberately small species/season adjustment only where a study supports one.
+The contour overlay remains an optional layer on the existing map, and pin
+popups distinguish mapped depth context from measured depth or a confirmed
+hotspot.
+
+The species/season adjustments are intentionally conservative. Summer
+smallmouth and walleye transition preferences receive only small, low-confidence
+weights from studies of one Maine lake and Lake Erie, respectively. Summer
+trout rankings do not assume the deepest water is suitable because MassWildlife
+documents the joint temperature/oxygen limitation. Pike depth is not pushed
+deeper without dissolved-oxygen data. For species without a sufficiently
+relevant source, the app does not invent a species-specific depth preference.
+The current NWS day/night period is reported when available, but no
+species-wide diel pin shift is applied: the form groups trout species, while
+MassWildlife's nocturnal note applies specifically to brown trout.
+
+MassGIS documents the contour unit and typical contour intervals, but the
+queried feature service does not provide a per-waterbody survey date or sounding
+density. The reported interval is inferred from distinct contour values
+returned for that waterbody. Contours are interpolated lines, not depth readings
+at the pins; temperature layers, dissolved oxygen, vegetation, substrate, and
+local fish presence are not inferred from them. If a state layer returns no
+contours, the map links to the official data page when one is available. No
+unmatched or unverified PDF is presented as a chart for the selected water.
 
 ### Research sources
 
@@ -67,6 +100,31 @@ occurrence or guaranteed catch rates.
 - USGS, [Water Data](https://waterdata.usgs.gov/nwis): source for nearby
   measured water-temperature readings. Sensor distance and freshness remain
   important limitations.
+- MassGIS and MassWildlife,
+  [inland water bathymetry](https://www.mass.gov/info-details/massgis-data-masswildlife-inland-water-bathymetry):
+  documents depth in feet, `SHORE` coding, GPS/depth-sounder collection,
+  interpolation, and typical 2-, 5-, or 10-foot contour intervals. The
+  December 2024 layer update does not establish an individual pond's survey
+  date.
+- MassWildlife, [Finding summer trout](https://www.mass.gov/info-details/finding-summer-trout)
+  and [Trout identification and fishing tips](https://www.mass.gov/info-details/trout-identification-and-fishing-tips):
+  summer trout need both suitable temperature and oxygen; only brown trout are
+  specifically described as more nocturnal.
+- Cole and Moring, [smallmouth bass movements in a central Maine lake](https://www.usgs.gov/publications/relation-adult-size-movements-and-distribution-smallmouth-bass-a-central-maine-lake):
+  larger smallmouth used deeper water more often in late summer in that lake.
+  This single-lake study supports only a small, low-confidence summer transition
+  adjustment, not an exact Massachusetts depth.
+- Raby et al., [Lake Erie walleye seasonal movement](https://doi.org/10.1139/cjfas-2017-0145):
+  some adults moved from warmer shallow basins toward deeper/cooler basins, but
+  temperature alone did not explain movement. The result is weakly transferable
+  to small ponds and is applied only as a small summer adjustment.
+- [Northern pike depth and thermal habitat in three Minnesota lakes](https://doi.org/10.1080/00028487.2013.822422):
+  depth use varies seasonally and can be constrained by dissolved oxygen; no
+  deep-water pin preference is assumed without a local oxygen profile.
+- Hafs et al., [smallmouth summer habitat in a low-flow Arkansas stream](https://doi.org/10.1577/M08-183.1):
+  stream telemetry documented depth and boulder-habitat use. It is not treated
+  as a lake rule; it reinforces the need not to transfer habitat findings
+  blindly between river and lake settings.
 - On The Water, [Massachusetts Fishing Report, November 5, 2026](https://onthewater.com/fishing-reports/2026/11/massachusetts-fishing-report-november-5-2026):
   exact-water reports included shallow pike catches at Lake Quinsigamond,
   Indian Lake, and Flint Pond (spinnerbaits, inline spinners, and shiners), and

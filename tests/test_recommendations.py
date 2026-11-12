@@ -533,6 +533,102 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(contours["unit"], "ft")
         self.assertEqual(contours["contours"][0]["depth"], 40)
 
+    def test_massachusetts_bathymetry_uses_matched_palis_id_and_filters_shore_lines(self):
+        def feature(depth, palis_id=71040, shore=0, longitude=-71.16):
+            return {
+                "attributes": {
+                    "NAME": "SPY POND",
+                    "DEPTH": depth,
+                    "PALIS_ID": palis_id,
+                    "SHORE": shore,
+                    "DLABEL": f"{depth} ft",
+                },
+                "geometry": {
+                    "paths": [[[longitude, 42.41], [longitude + 0.001, 42.41]]]
+                },
+            }
+
+        response = {
+            "features": [
+                feature(5),
+                feature(10),
+                feature(15),
+                feature(0, shore=1),
+                feature(40, palis_id=99999, longitude=-71.15),
+            ]
+        }
+        location = {
+            "place": "Spy Pond",
+            "latitude": 42.41,
+            "longitude": -71.16,
+        }
+        with patch.object(server, "_external_json", return_value=response) as request:
+            bathymetry = server._bathymetry_contours(
+                location, "MA", "Spy Pond", palis_id=71040
+            )
+
+        self.assertIn("PALIS_ID%3D71040", request.call_args.args[0])
+        self.assertTrue(bathymetry["available"])
+        self.assertEqual(bathymetry["unit"], "ft")
+        self.assertEqual(bathymetry["palis_id"], 71040)
+        self.assertEqual(
+            {contour["depth"] for contour in bathymetry["contours"]},
+            {5, 10, 15},
+        )
+        self.assertEqual(bathymetry["min_depth"], 5)
+        self.assertEqual(bathymetry["max_depth"], 15)
+        self.assertEqual(bathymetry["depth_interval_ft"], 5)
+        self.assertIsNone(bathymetry["survey_date"])
+        self.assertIn("MassGIS", bathymetry["attribution"])
+
+    def test_summer_smallmouth_depth_adjustment_is_limited_to_mapped_transitions(self):
+        ring = [
+            [-71.01, 42.01],
+            [-70.99, 42.01],
+            [-70.99, 41.99],
+            [-71.01, 41.99],
+            [-71.01, 42.01],
+        ]
+        contours = []
+        for longitude, latitude in ring[:-1]:
+            contours.extend(
+                [
+                    {
+                        "depth": depth,
+                        "coordinates": [
+                            [longitude, latitude],
+                            [longitude + 0.0001, latitude + 0.0001],
+                        ],
+                    }
+                    for depth in (10, 15)
+                ]
+            )
+        bathymetry = {"unit": "ft", "contours": contours}
+        wind = {"current": {"available": False}}
+
+        summer = server._shoreline_spots(
+            ring, wind, bathymetry, "Smallmouth Bass", season="summer"
+        )
+        spring = server._shoreline_spots(
+            ring, wind, bathymetry, "Smallmouth Bass", season="spring"
+        )
+        largemouth = server._shoreline_spots(
+            ring, wind, bathymetry, "Largemouth Bass", season="summer"
+        )
+
+        self.assertEqual(len(summer), 3)
+        self.assertTrue(
+            all(
+                spot["depth_context"]["feature"] == "mid_to_deep_transition"
+                for spot in summer
+            )
+        )
+        self.assertTrue(all(spot["depth_rank_adjustment"] == 0.35 for spot in summer))
+        self.assertTrue(all(spot["depth_rank_adjustment"] == 0 for spot in spring))
+        self.assertTrue(
+            all(spot["depth_rank_adjustment"] == 0 for spot in largemouth)
+        )
+
     def test_windy_day_prioritizes_a_moving_shore_lure_without_showing_forecast(self):
         calm = server._recommend_lures("Largemouth Bass", 55, "winter", {})
         windy = server._recommend_lures(

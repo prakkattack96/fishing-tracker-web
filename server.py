@@ -24,6 +24,13 @@ from fastapi.responses import FileResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from fish_behavior import (
+    KNOWLEDGE_ACCESSED_ON,
+    KNOWLEDGE_BASE_VERSION,
+    SOURCES as FISH_BEHAVIOR_SOURCES,
+    profile_for_species,
+)
+
 
 APP_DIRECTORY = Path(__file__).resolve().parent
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
@@ -821,6 +828,7 @@ def _local_time_and_wind(location: dict) -> tuple[str, datetime, dict]:
         }
         for category in ("daytime", "nighttime")
     }
+    current_period = None
     for period in periods:
         if not isinstance(period, dict) or not isinstance(period.get("isDaytime"), bool):
             continue
@@ -828,6 +836,8 @@ def _local_time_and_wind(location: dict) -> tuple[str, datetime, dict]:
             start = datetime.fromisoformat(str(period["startTime"])).astimezone(zone)
         except (KeyError, TypeError, ValueError):
             continue
+        if start <= local_now < start + timedelta(hours=1):
+            current_period = "day" if period["isDaytime"] else "night"
         if start < local_now or start > next_day:
             continue
         category = "daytime" if period["isDaytime"] else "nighttime"
@@ -890,6 +900,7 @@ def _local_time_and_wind(location: dict) -> tuple[str, datetime, dict]:
     wind["current"] = _current_station_wind(
         observation_stations_url, location, local_now
     )
+    wind["current_period"] = current_period
     return timezone_name, local_now, wind
 
 
@@ -1242,10 +1253,11 @@ def _waterbody_geometry(
             "message": "A waterbody outline could not be matched by name.",
         }
     search_token = sorted(tokens, key=lambda token: (-len(token), token))[0]
+    out_fields = f"{name_field},PALIS_ID" if state == "MA" else name_field
     query = endpoint + "?" + urlencode(
         {
             "where": f"UPPER({name_field}) LIKE '%{search_token.upper()}%'",
-            "outFields": name_field,
+            "outFields": out_fields,
             "returnGeometry": "true",
             "returnCentroid": "true",
             "outSR": "4326",
@@ -1302,25 +1314,36 @@ def _waterbody_geometry(
         distance = _distance_miles(
             location["latitude"], location["longitude"], latitude, longitude
         )
-        candidates.append((distance, map_geometry, shoreline_ring))
+        try:
+            palis_id = int(attributes["PALIS_ID"]) if state == "MA" else None
+        except (KeyError, TypeError, ValueError):
+            palis_id = None
+        candidates.append((distance, map_geometry, shoreline_ring, palis_id))
     if not candidates:
         return {
             "geometry": None,
             "shoreline_ring": [],
             "source": source,
+            "palis_id": None,
             "message": f"No {source} outline is published for this waterbody.",
         }
-    _, geometry, shoreline_ring = min(candidates, key=lambda candidate: candidate[0])
+    _, geometry, shoreline_ring, palis_id = min(
+        candidates, key=lambda candidate: candidate[0]
+    )
     return {
         "geometry": geometry,
         "shoreline_ring": shoreline_ring,
         "source": source,
+        "palis_id": palis_id,
         "message": None,
     }
 
 
 def _bathymetry_contours(
-    location: dict, state: str, water_body: str | None = None
+    location: dict,
+    state: str,
+    water_body: str | None = None,
+    palis_id: int | None = None,
 ) -> dict:
     if state == "MA":
         endpoint, name_field, depth_field = MA_BATHYMETRY_URL, "NAME", "DEPTH"
@@ -1329,7 +1352,15 @@ def _bathymetry_contours(
             "https://arcgisserver.digital.mass.gov/arcgisserver/rest/services/"
             "AGOL/MassWildlife_Inland_Bathymetry/FeatureServer"
         )
-        unit = None
+        source_info_url = (
+            "https://www.mass.gov/info-details/"
+            "massgis-data-masswildlife-inland-water-bathymetry"
+        )
+        attribution = (
+            "Bureau of Geographic Information (MassGIS), Commonwealth of "
+            "Massachusetts, Executive Office of Technology and Security Services."
+        )
+        unit = "ft"
     elif state == "NH":
         endpoint, name_field, depth_field = NH_BATHYMETRY_URL, "lake", "depth"
         source = "NH DES / NH Fish and Game bathymetry"
@@ -1337,6 +1368,8 @@ def _bathymetry_contours(
             "https://nhgeodata.unh.edu/hosting/rest/services/Hosted/"
             "EDP_Bathymetry_Lakes/FeatureServer"
         )
+        source_info_url = source_url
+        attribution = None
         unit = "ft"
     else:
         return {
@@ -1356,12 +1389,25 @@ def _bathymetry_contours(
             "contours": [],
         }
     search_token = sorted(tokens, key=lambda token: (-len(token), token))[0]
+    valid_palis_id = (
+        palis_id
+        if state == "MA" and isinstance(palis_id, int) and not isinstance(palis_id, bool)
+        else None
+    )
+    where = (
+        f"PALIS_ID={valid_palis_id}"
+        if valid_palis_id is not None
+        else f"UPPER({name_field}) LIKE '%{search_token.upper()}%'"
+    )
+    out_fields = (
+        f"{name_field},{depth_field},PALIS_ID,SHORE,DLABEL"
+        if state == "MA"
+        else f"{name_field},{depth_field}"
+    )
     query = endpoint + "?" + urlencode(
         {
-            "where": f"UPPER({name_field}) LIKE '%{search_token.upper()}%'",
-            "outFields": f"{name_field},{depth_field},DLABEL"
-            if state == "MA"
-            else f"{name_field},{depth_field}",
+            "where": where,
+            "outFields": out_fields,
             "returnGeometry": "true",
             "outSR": "4326",
             "geometryPrecision": 5,
@@ -1378,6 +1424,8 @@ def _bathymetry_contours(
             "contours": [],
             "source": source,
             "source_url": source_url,
+            "source_info_url": source_info_url,
+            "unit": unit,
         }
     features = result.get("features")
     if not isinstance(features, list):
@@ -1387,10 +1435,12 @@ def _bathymetry_contours(
             "contours": [],
             "source": source,
             "source_url": source_url,
+            "source_info_url": source_info_url,
+            "unit": unit,
         }
 
-    contours = []
-    total_points = 0
+    matched_features = []
+    candidate_ids: dict[int, float] = {}
     for feature in features:
         if not isinstance(feature, dict):
             continue
@@ -1401,6 +1451,8 @@ def _bathymetry_contours(
         feature_tokens = _waterbody_tokens(str(attributes.get(name_field, "")))
         if not tokens.issubset(feature_tokens):
             continue
+        if state == "MA" and str(attributes.get("SHORE", "0")) == "1":
+            continue
         try:
             depth = float(attributes[depth_field])
         except (KeyError, TypeError, ValueError):
@@ -1410,20 +1462,56 @@ def _bathymetry_contours(
         paths = geometry.get("paths")
         if not isinstance(paths, list):
             continue
-        for path in paths:
-            coordinates = _map_path(path, 100)
-            if len(coordinates) < 2:
-                continue
-            nearest_distance = min(
+        try:
+            feature_palis_id = int(attributes["PALIS_ID"]) if state == "MA" else None
+        except (KeyError, TypeError, ValueError):
+            feature_palis_id = None
+        nearest_distance = min(
+            (
                 _distance_miles(
                     location["latitude"],
                     location["longitude"],
-                    latitude,
-                    longitude,
+                    float(point[1]),
+                    float(point[0]),
                 )
-                for longitude, latitude in coordinates
+                for path in paths
+                if isinstance(path, list)
+                for point in path
+                if isinstance(point, (list, tuple)) and len(point) >= 2
+            ),
+            default=float("inf"),
+        )
+        if nearest_distance > 8:
+            continue
+        matched_features.append(
+            (feature, attributes, geometry, feature_palis_id, nearest_distance)
+        )
+        if feature_palis_id is not None:
+            candidate_ids[feature_palis_id] = min(
+                nearest_distance,
+                candidate_ids.get(feature_palis_id, float("inf")),
             )
-            if nearest_distance > 8:
+
+    selected_palis_id = valid_palis_id
+    if state == "MA" and selected_palis_id is None and candidate_ids:
+        selected_palis_id = min(
+            candidate_ids, key=lambda identifier: candidate_ids[identifier]
+        )
+
+    contours = []
+    total_points = 0
+    for feature, attributes, geometry, feature_palis_id, _ in matched_features:
+        if (
+            state == "MA"
+            and selected_palis_id is not None
+            and feature_palis_id != selected_palis_id
+        ):
+            continue
+        depth = float(attributes[depth_field])
+        paths = geometry["paths"]
+        for path in paths:
+            coordinates = _map_path(path, 100)
+            if len(coordinates) < 2:
                 continue
             if total_points + len(coordinates) > 1800:
                 break
@@ -1436,15 +1524,43 @@ def _bathymetry_contours(
             total_points += len(coordinates)
         if total_points >= 1800:
             break
+    depths = sorted({contour["depth"] for contour in contours})
+    intervals = [
+        round(second - first, 3)
+        for first, second in zip(depths, depths[1:])
+        if second > first
+    ]
+    contour_interval = (
+        max(set(intervals), key=lambda interval: (intervals.count(interval), -interval))
+        if intervals
+        else None
+    )
+    contour_metadata = {
+        "source": source,
+        "source_url": source_url,
+        "source_info_url": source_info_url,
+        "attribution": attribution,
+        "unit": unit,
+        "contours": contours,
+        "palis_id": selected_palis_id,
+        "min_depth": depths[0] if depths else None,
+        "max_depth": depths[-1] if depths else None,
+        "depth_interval_ft": contour_interval if state == "MA" else None,
+        "survey_date": None,
+        "data_quality": (
+            "Depths are interpolated contours, not a sounding at each shoreline "
+            "pin. The source does not publish this waterbody's survey date or "
+            "sounding density in the queried layer."
+            if state == "MA"
+            else "Depths are mapped contours, not a sounding at each shoreline pin."
+        ),
+    }
     return {
         "available": bool(contours),
         "message": None
         if contours
         else f"No published depth contours were found for {location.get('place', 'this waterbody')}.",
-        "unit": unit,
-        "contours": contours,
-        "source": source,
-        "source_url": source_url,
+        **contour_metadata,
     }
 
 
@@ -1471,6 +1587,7 @@ def _shoreline_spots(
     target_species: str = "",
     access_spots: list[dict] | None = None,
     access_message: str | None = None,
+    season: str = "",
 ) -> list[dict]:
     if len(shoreline_ring) < 4:
         return []
@@ -1493,60 +1610,109 @@ def _shoreline_spots(
             (240, "Southwest shoreline check"),
         ]
 
-    depth_ranges = {
-        "largemouth bass": (5, 20),
-        "smallmouth bass": (10, 30),
-        "crappie": (5, 15),
-        "walleye": (10, 30),
-        "northern pike": (5, 15),
-        "catfish": (5, 20),
-        "trout": (5, 15),
-    }
-    preferred_depth = depth_ranges.get(target_species.casefold(), (5, 20))
-    contour_points = []
+    profile = profile_for_species(target_species)
+    contour_levels: dict[float, list[tuple[float, float]]] = {}
     if bathymetry and bathymetry.get("unit") == "ft":
         for contour in bathymetry.get("contours", []):
             coordinates = contour.get("coordinates", [])
             if not coordinates:
                 continue
             stride = max(1, len(coordinates) // 60)
-            contour_points.extend(
-                (float(point[0]), float(point[1]), float(contour["depth"]))
-                for point in coordinates[::stride]
-                if len(point) >= 2
+            try:
+                depth = float(contour["depth"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not math.isfinite(depth) or depth <= 0:
+                continue
+            points = contour_levels.setdefault(depth, [])
+            points.extend(
+                (float(coordinate[0]), float(coordinate[1]))
+                for coordinate in coordinates[::stride]
+                if isinstance(coordinate, (list, tuple)) and len(coordinate) >= 2
             )
 
-    def contour_context(point: list[float]) -> tuple[float, float | None]:
-        if not contour_points:
-            return 0.0, None
-        nearby = [
-            (
-                _distance_miles(point[1], point[0], contour_latitude, contour_longitude),
-                depth,
+    def contour_context(point: list[float]) -> dict:
+        nearest_by_depth = []
+        for depth, coordinates in contour_levels.items():
+            distance = min(
+                (
+                    _distance_miles(
+                        point[1], point[0], contour_latitude, contour_longitude
+                    )
+                    for contour_longitude, contour_latitude in coordinates
+                ),
+                default=float("inf"),
             )
-            for contour_longitude, contour_latitude, depth in contour_points
-        ]
-        distance, depth = min(
-            nearby,
-            key=lambda item: (
-                item[0] + min(abs(item[1] - sum(preferred_depth) / 2) / 10, 2),
-                item[0],
-            ),
+            nearest_by_depth.append((distance, depth))
+        nearest_by_depth.sort()
+        nearby = sorted(
+            (depth, distance)
+            for distance, depth in nearest_by_depth
+            if distance <= 0.05
         )
-        return distance, depth
+        if not nearest_by_depth or nearest_by_depth[0][0] > 0.3:
+            return {
+                "nearest_depth_ft": None,
+                "nearest_distance_miles": None,
+                "nearby_contours_ft": [],
+                "feature": "no_contour",
+                "seasonal_adjustment": 0.0,
+            }
+        nearest_distance, nearest_depth = nearest_by_depth[0]
+        nearby_depths = sorted({depth for depth, _ in nearby})
+        if len(nearby_depths) >= 2:
+            shallowest, deepest = nearby_depths[0], nearby_depths[-1]
+            if shallowest <= 5 and deepest <= 10:
+                feature = "shallow_transition"
+            elif shallowest < 15 and deepest >= 15:
+                feature = "mid_to_deep_transition"
+            else:
+                feature = "deep_transition"
+        elif nearest_depth <= 10:
+            feature = "shallow_edge"
+        elif nearest_depth <= 20:
+            feature = "mid_depth_edge"
+        else:
+            feature = "deep_edge"
+        return {
+            "nearest_depth_ft": nearest_depth,
+            "nearest_distance_miles": nearest_distance,
+            "nearby_contours_ft": nearby_depths,
+            "feature": feature,
+            "seasonal_adjustment": profile["seasonal_adjustments"].get(
+                season, {}
+            ).get(feature, 0.0),
+        }
 
     candidates = []
     for point in shoreline_ring:
         bearing = _bearing_degrees(latitude, longitude, point[1], point[0])
-        contour_distance, contour_depth = contour_context(point)
-        depth_penalty = (
-            min(abs(contour_depth - sum(preferred_depth) / 2) / 10, 2)
-            if contour_depth is not None
-            else 0
-        )
-        candidates.append(
-            (bearing, point, contour_distance, contour_depth, depth_penalty)
-        )
+        context = contour_context(point)
+        candidates.append({"bearing": bearing, "point": point, "depth_context": context})
+
+    def depth_guidance(context: dict) -> str:
+        nearby_depths = context.get("nearby_contours_ft", [])
+        if nearby_depths:
+            interval = bathymetry.get("depth_interval_ft") if bathymetry else None
+            interval_text = (
+                f" The mapped contour interval is approximately {interval:g} ft."
+                if isinstance(interval, (int, float))
+                else ""
+            )
+            return (
+                " Nearby mapped contours are "
+                + ", ".join(f"{depth:g} ft" for depth in nearby_depths)
+                + "; this indicates relative bottom structure, not the depth at "
+                "the bank or a proven fish-holding spot."
+                + interval_text
+            )
+        if context.get("nearest_depth_ft") is not None:
+            return (
+                f" The nearest mapped contour is about "
+                f"{context['nearest_distance_miles']:.2f} mi away; it is not a "
+                "measured depth at this pin."
+            )
+        return " No nearby mapped contour supports a depth-specific claim here."
 
     selected = []
     for access in access_spots or []:
@@ -1589,29 +1755,45 @@ def _shoreline_spots(
                 "access_type": access_type,
                 "access_status": access.get("access_status"),
                 "source": access.get("source"),
+                "depth_context": contour_context(
+                    [point_longitude, point_latitude]
+                ),
             }
         )
 
     for target_bearing, label in targets:
-        ordered = sorted(
-            candidates,
-            key=lambda item: (
-                min(
-                    (item[0] - target_bearing) % 360,
-                    (target_bearing - item[0]) % 360,
-                )
-                + min(item[2], 0.5) * 12
-                + item[4] * 4
-            ),
-        )
+        def rank(candidate: dict) -> float:
+            angular_error = min(
+                (candidate["bearing"] - target_bearing) % 360,
+                (target_bearing - candidate["bearing"]) % 360,
+            )
+            context = candidate["depth_context"]
+            contour_distance = context["nearest_distance_miles"]
+            contour_proximity = (
+                max(0.0, 1 - contour_distance / 0.25)
+                if contour_distance is not None
+                else 0.0
+            )
+            structural_bonus = (
+                0.15 if len(context["nearby_contours_ft"]) >= 2 else 0.0
+            )
+            seasonal_adjustment = context["seasonal_adjustment"]
+            return (
+                1 - angular_error / 180
+                + 0.2 * contour_proximity
+                + structural_bonus
+                + seasonal_adjustment
+            )
+
+        ordered = sorted(candidates, key=rank, reverse=True)
         point = next(
             (
-                candidate
-                for _, candidate, _, _, _ in ordered
+                candidate["point"]
+                for candidate in ordered
                 if all(
                     _distance_miles(
-                        candidate[1],
-                        candidate[0],
+                        candidate["point"][1],
+                        candidate["point"][0],
                         existing["latitude"],
                         existing["longitude"],
                     )
@@ -1623,8 +1805,8 @@ def _shoreline_spots(
         )
         if point is None:
             continue
-        candidate = next(item for item in ordered if item[1] is point)
-        contour_distance, contour_depth = candidate[2], candidate[3]
+        candidate = next(item for item in ordered if item["point"] is point)
+        context = candidate["depth_context"]
         if direction is not None and speed is not None and speed >= 3:
             reason = (
                 f"Wind from {current.get('wind_direction')} points toward the "
@@ -1637,11 +1819,7 @@ def _shoreline_spots(
                 "No usable current wind direction; this is a general shoreline "
                 "checkpoint, not a confirmed hotspot."
             )
-        if contour_depth is not None and contour_distance <= 0.15:
-            reason += (
-                f" A published {contour_depth:g}-ft contour is nearby; it is "
-                "depth context, not a measured depth at the bank."
-            )
+        reason += depth_guidance(context)
         if access_message:
             reason += f" {access_message}"
         elif not any(
@@ -1666,6 +1844,8 @@ def _shoreline_spots(
                 "label": label,
                 "reason": reason,
                 "access_type": "Unverified shoreline section",
+                "depth_context": context,
+                "depth_rank_adjustment": context["seasonal_adjustment"],
             }
         )
     return selected[:3]
@@ -1723,9 +1903,20 @@ def _waterbody_map_data(
     water_body: str | None = None,
     target_species: str = "",
     access_data: dict | None = None,
+    season: str = "",
+    water_temperature: dict | None = None,
 ) -> dict:
     outline = _waterbody_geometry(location, state, water_body)
-    bathymetry = _bathymetry_contours(location, state, water_body)
+    bathymetry = _bathymetry_contours(
+        location, state, water_body, outline.get("palis_id")
+    )
+    profile = profile_for_species(target_species)
+    behavior_note = profile["behavior_note"]
+    if profile["seasonal_adjustments"] and season not in profile["seasonal_adjustments"]:
+        behavior_note = (
+            f"No species-specific depth adjustment is applied for {season}; "
+            "the limited supporting evidence applies only in summer."
+        )
     shoreline_spots = _shoreline_spots(
         outline["shoreline_ring"],
         wind,
@@ -1733,7 +1924,17 @@ def _waterbody_map_data(
         target_species,
         (access_data or {}).get("shore_access", []),
         (access_data or {}).get("message"),
+        season,
     )
+    behavior_sources = [
+        {
+            "id": source_id,
+            **FISH_BEHAVIOR_SOURCES[source_id],
+            "accessed_on": KNOWLEDGE_ACCESSED_ON,
+        }
+        for source_id in profile["source_ids"]
+        if source_id in FISH_BEHAVIOR_SOURCES
+    ]
     access_source_urls = {
         "Massachusetts Office of Fishing and Boating Access": (
             "https://www.mass.gov/info-details/saltwater-fishing-public-access"
@@ -1767,6 +1968,28 @@ def _waterbody_map_data(
             wind, location.get("water_type", "waterbody")
         ),
         "bathymetry": bathymetry,
+        "depth_guidance": {
+            "species": target_species,
+            "season": season,
+            "local_period": wind.get("current_period"),
+            "knowledge_base_version": KNOWLEDGE_BASE_VERSION,
+            "knowledge_accessed_on": KNOWLEDGE_ACCESSED_ON,
+            "confidence": profile["confidence"],
+            "behavior_note": behavior_note,
+            "limitations": profile["limitations"],
+            "sources": behavior_sources,
+            "water_temperature": (
+                {
+                    "temperature_f": water_temperature["temperature_f"],
+                    "distance_miles": water_temperature["distance_miles"],
+                }
+                if water_temperature
+                and water_temperature.get("available")
+                and isinstance(water_temperature.get("distance_miles"), (int, float))
+                and isinstance(water_temperature.get("temperature_f"), (int, float))
+                else None
+            ),
+        },
     }
 
 
@@ -2931,7 +3154,14 @@ def build_recommendation_report(payload: RecommendationRequest) -> dict:
     if access_message:
         access_data["message"] = access_message
     waterbody_map = _waterbody_map_data(
-        location, state, weather, water_body, target_species, access_data
+        location,
+        state,
+        weather,
+        water_body,
+        target_species,
+        access_data,
+        season,
+        water_temperature,
     )
     return {
         "water_body": water_body,
