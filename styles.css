@@ -359,6 +359,8 @@ input[type="file"]::file-selector-button {
 .recommendation-map .leaflet-popup-content p { margin: 6px 0; }
 .map-attribution { display: block; margin-top: 12px; color: var(--muted); font-size: .68rem; }
 .map-attribution a { color: inherit; }
+.depth-chart-pdf { margin: 0 10px 10px 0; }
+.depth-chart-pdf-status { margin-right: 10px; }
 footer { display: flex; justify-content: space-between; gap: 10px; max-width: 1180px; margin: auto; padding: 18px 28px 28px; color: #7897a4; font-size: .75rem; }
 
 @media (max-width: 760px) {

@@ -19,12 +19,16 @@ It uses:
   day/night lure ranking using wind, cloud cover, precipitation probability,
   and air-temperature changes; those forecasts are not displayed as local
   fishing facts.
-- A satellite map from Esri, a state waterbody outline when available, and
-  official Massachusetts or New Hampshire bathymetric contours when available.
+- A satellite map from Esri, state waterbody outlines when available, and an
+  OpenStreetMap boundary fallback when a state outline is unavailable. Official
+  Massachusetts or New Hampshire bathymetric contours are shown when available.
   Massachusetts contour depths are in feet. The app matches mapped MassGIS
   waterbodies by `PALIS_ID`, excludes shoreline/island lines, and exposes the
   available contour-depth range and interval. The interactive contour overlay
   remains on the existing map.
+- Current NWS station wind when fresh and complete, falling back to a
+  timestamp-checked Open-Meteo model estimate when station wind is missing.
+  The map labels modelled wind separately from station observations.
 - Seasonal and nearby-water-temperature lure profiles with specific sizes,
   rigging, retrieval, shore habitat, rationale, and a backup presentation.
 - Public shoreline-access pins only when the state or OpenStreetMap record
@@ -73,9 +77,14 @@ queried feature service does not provide a per-waterbody survey date or sounding
 density. The reported interval is inferred from distinct contour values
 returned for that waterbody. Contours are interpolated lines, not depth readings
 at the pins; temperature layers, dissolved oxygen, vegetation, substrate, and
-local fish presence are not inferred from them. If a state layer returns no
-contours, the map links to the official data page when one is available. No
-unmatched or unverified PDF is presented as a chart for the selected water.
+local fish presence are not inferred from them. Where a waterbody has published
+contours, **Download depth chart PDF** creates a printable chart from the
+contours, outline, and suggested points currently shown in the map. This is an
+app-generated export of the source GIS data, not an official agency PDF or a
+survey-quality nautical chart. When contours are unavailable, no substitute
+depth chart is invented; the map links to an official data page when available.
+OpenStreetMap outlines and shoreline checkpoints are approximate geometry and
+do not establish public access or a proven fishing hotspot.
 
 ### Research sources
 
@@ -100,6 +109,9 @@ occurrence or guaranteed catch rates.
 - USGS, [Water Data](https://waterdata.usgs.gov/nwis): source for nearby
   measured water-temperature readings. Sensor distance and freshness remain
   important limitations.
+- Open-Meteo, [Weather Forecast API](https://open-meteo.com/en/docs): modelled
+  current wind fallback when a recent, direction-bearing NWS observation is not
+  available; it is labeled as an estimate rather than a station measurement.
 - MassGIS and MassWildlife,
   [inland water bathymetry](https://www.mass.gov/info-details/massgis-data-masswildlife-inland-water-bathymetry):
   documents depth in feet, `SHORE` coding, GPS/depth-sounder collection,

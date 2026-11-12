@@ -93,6 +93,7 @@ class RecommendationTests(unittest.TestCase):
             "lon": "-74.66",
             "name": "Carnegie Lake",
             "display_name": "Carnegie Lake, Princeton, New Jersey, United States",
+            "class": None,
             "type": "reservoir",
             "address": {"state": "New Jersey", "ISO3166-2-lvl4": "US-NJ"},
         }
@@ -105,6 +106,50 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(location["provider"], "OpenStreetMap")
         self.assertEqual(location["latitude"], 40.35)
         self.assertIn("Carnegie Lake", location["place"])
+
+    def test_town_qualifier_finds_waterbody_that_spans_an_adjacent_town(self):
+        waterbody = {
+            "lat": "40.3528",
+            "lon": "-74.6268",
+            "name": "Lake Carnegie",
+            "display_name": (
+                "Lake Carnegie, Plainsboro Township, Middlesex County, "
+                "New Jersey, United States"
+            ),
+            "class": None,
+            "type": "reservoir",
+            "address": {
+                "town": "Plainsboro Township",
+                "state": "New Jersey",
+                "ISO3166-2-lvl4": "US-NJ",
+            },
+        }
+        locality = {
+            "lat": "40.3573",
+            "lon": "-74.6672",
+            "name": "Princeton",
+            "display_name": "Princeton, Mercer County, New Jersey, United States",
+            "address": {
+                "town": "Princeton",
+                "state": "New Jersey",
+                "ISO3166-2-lvl4": "US-NJ",
+            },
+        }
+        with (
+            patch.object(server, "_waterbody_site", return_value=(None, None)),
+            patch.object(
+                server,
+                "_nominatim_locations",
+                side_effect=[[waterbody], [locality]],
+            ),
+        ):
+            location = server._resolve_named_waterbody(
+                "Carnegie Lake, Princeton", "NJ"
+            )
+
+        self.assertEqual(location["provider"], "OpenStreetMap")
+        self.assertIn("Lake Carnegie", location["place"])
+        self.assertEqual(location["water_type"], "reservoir")
 
     def test_town_qualifier_resolves_duplicate_openstreetmap_results(self):
         candidates = [
@@ -399,7 +444,14 @@ class RecommendationTests(unittest.TestCase):
                 ]
             }
         }
-        with patch.object(server, "_external_json", side_effect=[point, forecast]):
+        with (
+            patch.object(server, "_external_json", side_effect=[point, forecast]),
+            patch.object(
+                server,
+                "_open_meteo_current_wind",
+                return_value={"available": False},
+            ),
+        ):
             timezone_name, local_now, wind = server._local_time_and_wind(
                 {"latitude": 40.35, "longitude": -74.66}
             )
@@ -414,6 +466,32 @@ class RecommendationTests(unittest.TestCase):
             wind["daytime"]["maximum_precipitation_probability_percent"], 60
         )
         self.assertEqual(wind["daytime"]["temperature_change_f"], -5)
+
+    def test_open_meteo_current_wind_is_explicitly_modelled_and_directional(self):
+        zone = ZoneInfo("America/New_York")
+        local_now = datetime.now(zone).replace(second=0, microsecond=0)
+        with patch.object(
+            server,
+            "_external_json",
+            return_value={
+                "current": {
+                    "time": local_now.strftime("%Y-%m-%dT%H:%M"),
+                    "wind_speed_10m": 7.5,
+                    "wind_direction_10m": 225,
+                }
+            },
+        ) as request:
+            wind = server._open_meteo_current_wind(
+                {"latitude": 42.4, "longitude": -71.1},
+                local_now,
+                "America/New_York",
+            )
+
+        self.assertTrue(wind["available"])
+        self.assertEqual(wind["wind_speed_mph"], 7.5)
+        self.assertEqual(wind["wind_direction"], "SW")
+        self.assertTrue(wind["is_modelled"])
+        self.assertIn("api.open-meteo.com", request.call_args.args[0])
 
     def test_current_station_wind_uses_nearest_fresh_observation(self):
         zone = ZoneInfo("America/New_York")
@@ -510,6 +588,77 @@ class RecommendationTests(unittest.TestCase):
         self.assertLess(spots[0]["latitude"], 42.0)
         self.assertIn("NW", spots[0]["reason"])
 
+    def test_calm_or_missing_wind_pin_reason_explains_the_shoreline_choice(self):
+        ring = [
+            [-71.01, 42.01],
+            [-70.99, 42.01],
+            [-70.99, 41.99],
+            [-71.01, 41.99],
+            [-71.01, 42.01],
+        ]
+        spots = server._shoreline_spots(
+            ring,
+            {"current": {"available": False, "message": "Station report stale."}},
+        )
+
+        self.assertEqual(len(spots), 3)
+        for spot in spots:
+            self.assertIn("Selected on the", spot["reason"])
+            self.assertIn("one of three spaced checks", spot["reason"])
+            self.assertIn("No validated current wind direction", spot["reason"])
+            self.assertNotIn("No usable current wind direction", spot["reason"])
+
+    def test_osm_polygon_fallback_adds_checked_shoreline_pins_outside_ma_and_nh(self):
+        polygon = {
+            "type": "Polygon",
+            "coordinates": [[
+                [-74.01, 40.01],
+                [-73.99, 40.01],
+                [-73.99, 39.99],
+                [-74.01, 39.99],
+                [-74.01, 40.01],
+            ]],
+        }
+        with patch.object(
+            server,
+            "_nominatim_locations",
+            return_value=[
+                {
+                    "name": "Carnegie Lake",
+                    "display_name": "Carnegie Lake, Princeton, New Jersey",
+                    "address": {
+                        "state": "New Jersey",
+                        "ISO3166-2-lvl4": "US-NJ",
+                    },
+                    "geojson": polygon,
+                }
+            ],
+        ) as lookup:
+            outline = server._waterbody_geometry(
+                {
+                    "latitude": 40.0,
+                    "longitude": -74.0,
+                    "place": "Carnegie Lake",
+                },
+                "NJ",
+                "Carnegie Lake",
+            )
+        spots = server._shoreline_spots(
+            outline["shoreline_ring"], {"current": {"available": False}}
+        )
+
+        self.assertEqual(outline["source"], "OpenStreetMap")
+        self.assertIsNotNone(outline["geometry"])
+        self.assertTrue(lookup.call_args.kwargs["include_polygon"])
+        self.assertEqual(len(spots), 3)
+        self.assertTrue(
+            all(
+                -74.01 <= spot["longitude"] <= -73.99
+                and 39.99 <= spot["latitude"] <= 40.01
+                for spot in spots
+            )
+        )
+
     def test_bathymetry_contours_are_returned_with_source_units(self):
         response = {
             "features": [
@@ -580,6 +729,111 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(bathymetry["depth_interval_ft"], 5)
         self.assertIsNone(bathymetry["survey_date"])
         self.assertIn("MassGIS", bathymetry["attribution"])
+
+    def test_contours_outside_selected_waterbody_outline_are_not_returned(self):
+        response = {
+            "features": [
+                {
+                    "attributes": {"lake": "WINNIPESAUKEE", "depth": 15},
+                    "geometry": {
+                        "paths": [[
+                            [-71.41, 43.60],
+                            [-71.40, 43.60],
+                            [-71.39, 43.60],
+                        ]]
+                    },
+                },
+                {
+                    "attributes": {"lake": "WINNIPESAUKEE", "depth": 30},
+                    "geometry": {
+                        "paths": [[
+                            [-71.00, 43.60],
+                            [-70.99, 43.60],
+                            [-70.98, 43.60],
+                        ]]
+                    },
+                },
+            ]
+        }
+        ring = [
+            [-71.42, 43.61],
+            [-71.38, 43.61],
+            [-71.38, 43.59],
+            [-71.42, 43.59],
+            [-71.42, 43.61],
+        ]
+        with patch.object(server, "_external_json", return_value=response):
+            contours = server._bathymetry_contours(
+                {
+                    "place": "Lake Winnipesaukee",
+                    "latitude": 43.6,
+                    "longitude": -71.4,
+                },
+                "NH",
+                shoreline_ring=ring,
+            )
+
+        self.assertTrue(contours["available"])
+        self.assertEqual(
+            {contour["depth"] for contour in contours["contours"]}, {15}
+        )
+
+    def test_depth_chart_pdf_contains_actual_contours_and_access_markers(self):
+        payload = server.DepthChartPdfRequest(
+            water_body="Spy Pond, Arlington",
+            state="MA",
+            map_data={
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[
+                        [-71.16, 42.41],
+                        [-71.15, 42.41],
+                        [-71.15, 42.42],
+                        [-71.16, 42.42],
+                        [-71.16, 42.41],
+                    ]],
+                },
+                "bathymetry": {
+                    "available": True,
+                    "source": "MassWildlife Inland Bathymetry",
+                    "source_url": "https://example.test/contours",
+                    "unit": "ft",
+                    "contours": [
+                        {
+                            "depth": 5,
+                            "coordinates": [
+                                [-71.159, 42.411],
+                                [-71.151, 42.419],
+                            ],
+                        }
+                    ],
+                    "attribution": "MassGIS",
+                },
+                "shoreline_spots": [
+                    {"longitude": -71.158, "latitude": 42.412}
+                ],
+            },
+        )
+
+        pdf = server._depth_chart_pdf(payload)
+
+        self.assertTrue(pdf.startswith(b"%PDF-1.4"))
+        self.assertTrue(pdf.rstrip().endswith(b"%%EOF"))
+        self.assertIn(b"Spy Pond, Arlington", pdf)
+        self.assertIn(b"MassWildlife Inland Bathymetry", pdf)
+        self.assertIn(b"Contours are interpolated depth lines", pdf)
+
+    def test_generated_depth_pdf_rejects_missing_bathymetry(self):
+        payload = server.DepthChartPdfRequest(
+            water_body="Unknown Pond",
+            state="MA",
+            map_data={"bathymetry": {"available": False, "contours": []}},
+        )
+
+        with self.assertRaises(HTTPException) as error:
+            server._depth_chart_pdf(payload)
+
+        self.assertEqual(error.exception.status_code, 422)
 
     def test_summer_smallmouth_depth_adjustment_is_limited_to_mapped_transitions(self):
         ring = [

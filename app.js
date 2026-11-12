@@ -652,6 +652,57 @@ function renderRecommendationMap(report) {
       "muted small",
       `${bathymetry.contours.length} published depth contours shown${depthRange}${interval}. Toggle “Depth contours” on the map; these interpolated lines are not depth readings at the shore pins.`
     ));
+    const pdfButton = document.createElement("button");
+    pdfButton.type = "button";
+    pdfButton.className = "button button-secondary depth-chart-pdf";
+    pdfButton.textContent = "Download depth chart PDF";
+    const pdfStatus = reportElement("span", "muted small depth-chart-pdf-status");
+    pdfButton.addEventListener("click", async () => {
+      pdfButton.disabled = true;
+      pdfStatus.textContent = "Preparing printable chart…";
+      pdfStatus.classList.remove("error");
+      try {
+        const response = await fetch(
+          `${(CONFIG.apiBaseUrl || "").replace(/\/$/, "")}/api/recommendations/depth-chart.pdf`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              water_body: report.water_body,
+              state: report.state.code,
+              map_data: mapData
+            })
+          }
+        );
+        if (!response.ok) {
+          let detail = `PDF export failed (${response.status}).`;
+          try {
+            const result = await response.json();
+            detail = result.detail || detail;
+          } catch {
+            // Keep the HTTP error if the response is not JSON.
+          }
+          throw new Error(detail);
+        }
+        const blob = await response.blob();
+        if (blob.type !== "application/pdf") {
+          throw new Error("The server did not return a PDF depth chart.");
+        }
+        const downloadUrl = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = downloadUrl;
+        link.download = `depth-chart-${report.water_body.toLowerCase().replace(/[^a-z0-9]+/g, "-")}.pdf`;
+        link.click();
+        window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
+        pdfStatus.textContent = "PDF chart downloaded.";
+      } catch (error) {
+        pdfStatus.textContent = error.message || "Could not create the PDF chart.";
+        pdfStatus.classList.add("error");
+      } finally {
+        pdfButton.disabled = false;
+      }
+    });
+    section.append(pdfButton, pdfStatus);
   } else if (mapData.bathymetry?.message) {
     section.append(reportElement("p", "muted small", mapData.bathymetry.message));
     if (mapData.bathymetry.source_info_url) {
@@ -700,7 +751,9 @@ function renderRecommendationMap(report) {
   if (mapData.boundary_source) {
     const href = mapData.boundary_source === "MassGIS"
       ? "https://services1.arcgis.com/hGdibHYSPO59RG1h/arcgis/rest/services/Massachusetts_Water_Features/FeatureServer"
-      : "https://nhgeodata.unh.edu/hosting/rest/services/Hosted/IWR_WaterResources/FeatureServer";
+      : mapData.boundary_source === "NH GRANIT"
+        ? "https://nhgeodata.unh.edu/hosting/rest/services/Hosted/IWR_WaterResources/FeatureServer"
+        : "https://www.openstreetmap.org/copyright";
     sources.push([mapData.boundary_source, href]);
   }
   if (mapData.bathymetry?.source_url) {
@@ -884,23 +937,28 @@ function renderRecommendationReport(report) {
     windPanel.append(reportElement("h3", "", "Current local wind"));
     const currentWind = report.wind?.current;
     if (currentWind?.available) {
-      const age = currentWind.age_minutes <= 1
+      const age = !Number.isFinite(currentWind.age_minutes) || currentWind.age_minutes <= 1
         ? "just now"
         : `${currentWind.age_minutes} min ago`;
       const direction = currentWind.wind_direction
         ? `from ${currentWind.wind_direction}`
         : "with variable direction";
+      const sourceDescription = currentWind.is_modelled
+        ? "current model estimate from Open-Meteo"
+        : `observed ${age} at ${currentWind.station || "the nearest NWS station"}`;
       windPanel.append(reportElement(
         "p",
         "",
-        `${currentWind.wind_speed_mph} mph ${direction} · observed ${age} at ${currentWind.station}`
+        `${currentWind.wind_speed_mph} mph ${direction} · ${sourceDescription}`
       ));
       if (currentWind.station_url) {
         const stationLink = document.createElement("a");
         stationLink.href = currentWind.station_url;
         stationLink.target = "_blank";
         stationLink.rel = "noopener noreferrer";
-        stationLink.textContent = "NWS station details";
+        stationLink.textContent = currentWind.is_modelled
+          ? "Open-Meteo source details"
+          : "NWS station details";
         windPanel.append(stationLink);
       }
     } else {

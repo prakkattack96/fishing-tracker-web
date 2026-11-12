@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import io
 import json
 import math
 import os
@@ -174,6 +175,12 @@ class RecommendationRequest(BaseModel):
     target_species: str = Field(default="", max_length=40)
 
 
+class DepthChartPdfRequest(BaseModel):
+    water_body: str = Field(min_length=2, max_length=100)
+    state: str = Field(min_length=2, max_length=2)
+    map_data: dict = Field()
+
+
 class DataSourceError(Exception):
     def __init__(self, source: str, message: str, status: int | None = None) -> None:
         super().__init__(message)
@@ -223,23 +230,24 @@ def _external_text(url: str, source: str) -> str:
     return result
 
 
-def _nominatim_locations(query: str) -> list:
+def _nominatim_locations(query: str, include_polygon: bool = False) -> list:
     global _last_geocoder_request
     with _geocoder_lock:
         wait = 1.0 - (time.monotonic() - _last_geocoder_request)
         if wait > 0:
             time.sleep(wait)
+        search_params = {
+            "q": query,
+            "format": "jsonv2",
+            "addressdetails": 1,
+            "limit": 5,
+            "countrycodes": "us",
+        }
+        if include_polygon:
+            search_params.update({"polygon_geojson": 1, "polygon_threshold": 0.002})
         request = Request(
             "https://nominatim.openstreetmap.org/search?"
-            + urlencode(
-                {
-                    "q": query,
-                    "format": "jsonv2",
-                    "addressdetails": 1,
-                    "limit": 5,
-                    "countrycodes": "us",
-                }
-            ),
+            + urlencode(search_params),
             headers={
                 "Accept": "application/json",
                 "User-Agent": (
@@ -618,7 +626,9 @@ def _resolve_named_waterbody(water_body: str, state: str) -> dict:
         ) from error
 
     query_tokens = _waterbody_tokens(water_body)
+    waterbody_tokens, explicit_locality_tokens = _waterbody_query_parts(water_body)
     matches = []
+    nearby_name_matches = []
     for candidate in candidates:
         if not isinstance(candidate, dict):
             continue
@@ -633,7 +643,8 @@ def _resolve_named_waterbody(water_body: str, state: str) -> dict:
         display_name = str(candidate.get("display_name", ""))
         searchable_name = f"{name} {display_name}".casefold()
         candidate_tokens = set(re.findall(r"[a-z0-9]+", searchable_name))
-        feature_class = str(candidate.get("class", "")).casefold()
+        raw_class = candidate.get("class")
+        feature_class = raw_class.casefold() if isinstance(raw_class, str) else ""
         feature_type = str(candidate.get("type", "")).casefold()
         if (
             feature_class and feature_class not in {"natural", "water", "waterway"}
@@ -653,30 +664,93 @@ def _resolve_named_waterbody(water_body: str, state: str) -> dict:
             "wetland",
         }:
             continue
-        if query_tokens and not query_tokens.issubset(candidate_tokens):
-            continue
-        if not query_tokens and water_body.casefold() not in searchable_name:
+        name_matches = (
+            waterbody_tokens.issubset(candidate_tokens)
+            if waterbody_tokens
+            else water_body.casefold() in searchable_name
+        )
+        query_matches = query_tokens.issubset(candidate_tokens) if query_tokens else name_matches
+        if not query_matches and not (explicit_locality_tokens and name_matches):
             continue
         try:
             latitude = float(candidate["lat"])
             longitude = float(candidate["lon"])
         except (KeyError, TypeError, ValueError):
             continue
-        matches.append(
-            {
-                "latitude": latitude,
-                "longitude": longitude,
-                "place": display_name or name or water_body,
-                "reference": f"OpenStreetMap result: {display_name or name or water_body}",
-                "provider": "OpenStreetMap",
-                "site": None,
-                "water_type": _infer_water_type(
-                    water_body, str(candidate.get("type", ""))
-                ),
-                "fishery": None,
-                "_candidate_name": name,
-            }
-        )
+        location_match = {
+            "latitude": latitude,
+            "longitude": longitude,
+            "place": display_name or name or water_body,
+            "reference": f"OpenStreetMap result: {display_name or name or water_body}",
+            "provider": "OpenStreetMap",
+            "site": None,
+            "water_type": _infer_water_type(
+                water_body, str(candidate.get("type", ""))
+            ),
+            "fishery": None,
+            "_candidate_name": name,
+        }
+        if query_matches:
+            matches.append(location_match)
+        else:
+            nearby_name_matches.append(location_match)
+    if not matches and nearby_name_matches and explicit_locality_tokens:
+        qualifier = re.search(r",|\b(?:in|near|at)\b", water_body, re.IGNORECASE)
+        locality = water_body[qualifier.end():].strip() if qualifier else ""
+        if locality:
+            try:
+                localities = _nominatim_locations(
+                    f"{locality}, {STATES[state]}, United States"
+                )
+            except DataSourceError:
+                localities = []
+            locality_points = []
+            for candidate in localities:
+                if not isinstance(candidate, dict):
+                    continue
+                address = candidate.get("address")
+                if not isinstance(address, dict):
+                    continue
+                candidate_state = str(address.get("state", "")).casefold()
+                state_code = str(address.get("ISO3166-2-lvl4", "")).split("-")[-1].upper()
+                address_text = " ".join(
+                    [str(candidate.get("name", "")), str(candidate.get("display_name", ""))]
+                    + [str(value) for value in address.values()]
+                )
+                address_tokens = set(re.findall(r"[a-z0-9]+", address_text.casefold()))
+                if (
+                    candidate_state != STATES[state].casefold()
+                    and state_code != state
+                ) or not explicit_locality_tokens.issubset(address_tokens):
+                    continue
+                try:
+                    locality_points.append(
+                        (float(candidate["lat"]), float(candidate["lon"]))
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+            ranked_nearby = []
+            for match in nearby_name_matches:
+                distance = min(
+                    _distance_miles(
+                        match["latitude"],
+                        match["longitude"],
+                        latitude,
+                        longitude,
+                    )
+                    for latitude, longitude in locality_points
+                ) if locality_points else math.inf
+                ranked_nearby.append((distance, match))
+            ranked_nearby.sort(key=lambda result: result[0])
+            if (
+                ranked_nearby
+                and ranked_nearby[0][0] <= 10
+                and (
+                    len(ranked_nearby) == 1
+                    or ranked_nearby[1][0] - ranked_nearby[0][0] >= 1
+                )
+            ):
+                matches.append(ranked_nearby[0][1])
     if not matches:
         detail = (
             f"USGS could not verify a named site ({site_error}). "
@@ -897,9 +971,19 @@ def _local_time_and_wind(location: dict) -> tuple[str, datetime, dict]:
                 else None
             ),
         }
-    wind["current"] = _current_station_wind(
+    current_wind = _current_station_wind(
         observation_stations_url, location, local_now
     )
+    if (
+        not current_wind.get("available")
+        or current_wind.get("wind_direction_degrees") is None
+    ):
+        model_wind = _open_meteo_current_wind(
+            location, local_now, timezone_name
+        )
+        if model_wind.get("available"):
+            current_wind = model_wind
+    wind["current"] = current_wind
     wind["current_period"] = current_period
     return timezone_name, local_now, wind
 
@@ -1024,6 +1108,67 @@ def _current_station_wind(
         "observed_at": observed_at.isoformat(),
         "age_minutes": round(max(age_minutes, 0)),
         "source": "National Weather Service",
+    }
+
+
+def _open_meteo_current_wind(
+    location: dict, local_now: datetime, timezone_name: str
+) -> dict:
+    unavailable = {
+        "available": False,
+        "message": "A current modelled wind estimate is unavailable.",
+        "source": "Open-Meteo",
+    }
+    query = urlencode(
+        {
+            "latitude": location["latitude"],
+            "longitude": location["longitude"],
+            "current": "wind_speed_10m,wind_direction_10m",
+            "wind_speed_unit": "mph",
+            "timezone": "auto",
+        }
+    )
+    try:
+        result = _external_json(
+            f"https://api.open-meteo.com/v1/forecast?{query}", "Open-Meteo"
+        )
+    except DataSourceError as error:
+        return {**unavailable, "message": str(error)}
+    current = result.get("current")
+    if not isinstance(current, dict):
+        return {**unavailable, "message": "Open-Meteo returned no current wind data."}
+    try:
+        speed = float(current["wind_speed_10m"])
+        direction = float(current["wind_direction_10m"]) % 360
+        observed_at = datetime.fromisoformat(str(current["time"]))
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=ZoneInfo(timezone_name))
+    except (KeyError, TypeError, ValueError, ZoneInfoNotFoundError) as error:
+        return {
+            **unavailable,
+            "message": f"Open-Meteo returned invalid current wind data ({error}).",
+        }
+    age_minutes = (
+        local_now.astimezone(timezone.utc) - observed_at.astimezone(timezone.utc)
+    ).total_seconds() / 60
+    if not math.isfinite(speed) or speed < 0 or age_minutes < -30 or age_minutes > 180:
+        return {
+            **unavailable,
+            "message": "Open-Meteo's current wind estimate is stale or invalid.",
+        }
+    compass = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")[
+        round(direction / 45) % 8
+    ]
+    return {
+        "available": True,
+        "wind_speed_mph": round(speed, 1),
+        "wind_direction_degrees": direction,
+        "wind_direction": compass,
+        "observed_at": observed_at.isoformat(),
+        "age_minutes": round(max(age_minutes, 0)),
+        "source": "Open-Meteo model estimate",
+        "station_url": "https://open-meteo.com/",
+        "is_modelled": True,
     }
 
 
@@ -1201,6 +1346,52 @@ def _distance_to_shoreline_miles(
     return nearest
 
 
+def _point_in_ring(longitude: float, latitude: float, ring: list[list[float]]) -> bool:
+    inside = False
+    for start, end in zip(ring, ring[1:]):
+        x1, y1 = start
+        x2, y2 = end
+        if (y1 > latitude) != (y2 > latitude):
+            crossing_longitude = (x2 - x1) * (latitude - y1) / (y2 - y1) + x1
+            if longitude < crossing_longitude:
+                inside = not inside
+    return inside
+
+
+def _shoreline_sample_points(ring: list[list[float]]) -> tuple[list[list[float]], float]:
+    segments = []
+    perimeter = 0.0
+    for start, end in zip(ring, ring[1:]):
+        length = _distance_miles(start[1], start[0], end[1], end[0])
+        if length <= 0:
+            continue
+        segments.append((start, end, length))
+        perimeter += length
+    if not segments or perimeter == 0:
+        return [], perimeter
+    count = min(240, max(12, math.ceil(perimeter / 0.025)))
+    samples = []
+    segment_index = 0
+    segment_start_miles = 0.0
+    for sample_index in range(count):
+        target_miles = perimeter * sample_index / count
+        while (
+            segment_index < len(segments) - 1
+            and segment_start_miles + segments[segment_index][2] < target_miles
+        ):
+            segment_start_miles += segments[segment_index][2]
+            segment_index += 1
+        start, end, length = segments[segment_index]
+        fraction = min(1.0, max(0.0, (target_miles - segment_start_miles) / length))
+        samples.append(
+            [
+                start[0] + (end[0] - start[0]) * fraction,
+                start[1] + (end[1] - start[1]) * fraction,
+            ]
+        )
+    return samples, perimeter
+
+
 def _ring_centroid(ring: list[list[float]]) -> tuple[float, float]:
     area = _ring_area(ring)
     if abs(area) < 1e-12:
@@ -1218,11 +1409,125 @@ def _ring_centroid(ring: list[list[float]]) -> tuple[float, float]:
     return latitude_sum / (6 * area), longitude_sum / (6 * area)
 
 
+def _geojson_map_geometry(
+    geometry: object, location: dict
+) -> tuple[dict | None, list[list[float]]]:
+    if not isinstance(geometry, dict):
+        return None, []
+    geometry_type = geometry.get("type")
+    coordinates = geometry.get("coordinates")
+    if geometry_type == "Polygon":
+        polygons = [coordinates]
+    elif geometry_type == "MultiPolygon" and isinstance(coordinates, list):
+        polygons = coordinates
+    else:
+        return None, []
+    polygons_rings = []
+    for polygon in polygons:
+        if not isinstance(polygon, list):
+            continue
+        rings = [
+            ring
+            for ring in (_map_path(item, 180) for item in polygon)
+            if len(ring) >= 4
+        ]
+        if rings:
+            polygons_rings.append(rings)
+    if not polygons_rings:
+        return None, []
+
+    def ring_distance(rings: list[list[list[float]]]) -> float:
+        latitude, longitude = _ring_centroid(rings[0])
+        return _distance_miles(
+            location["latitude"], location["longitude"], latitude, longitude
+        )
+
+    nearest_polygon = min(polygons_rings, key=ring_distance)
+    selected_ring = nearest_polygon[0]
+    if geometry_type == "Polygon":
+        return {"type": "Polygon", "coordinates": nearest_polygon}, selected_ring
+    return {
+        "type": "MultiPolygon",
+        "coordinates": [nearest_polygon],
+    }, selected_ring
+
+
 def _map_waterbody_tokens(water_body: str) -> set[str]:
     name_tokens, _ = _waterbody_query_parts(water_body)
     return name_tokens - {
         "lake", "river", "stream", "creek", "brook", "pond", "reservoir",
         "water", "the",
+    }
+
+
+def _osm_waterbody_geometry(
+    location: dict, state: str, water_body: str
+) -> dict:
+    source = "OpenStreetMap"
+    query = f"{water_body}, {STATES[state]}, United States"
+    try:
+        candidates = _nominatim_locations(query, include_polygon=True)
+    except DataSourceError as error:
+        return {
+            "geometry": None,
+            "shoreline_ring": [],
+            "source": source,
+            "palis_id": None,
+            "message": f"The OpenStreetMap waterbody outline is unavailable ({error}).",
+        }
+
+    tokens = _map_waterbody_tokens(water_body)
+    matches = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        address = candidate.get("address")
+        if not isinstance(address, dict):
+            continue
+        candidate_state = str(address.get("state", "")).casefold()
+        state_code = str(address.get("ISO3166-2-lvl4", "")).split("-")[-1].upper()
+        if candidate_state != STATES[state].casefold() and state_code != state:
+            continue
+        searchable = " ".join(
+            str(candidate.get(key, "")) for key in ("name", "display_name")
+        )
+        candidate_tokens = set(re.findall(r"[a-z0-9]+", searchable.casefold()))
+        if tokens and not tokens.issubset(candidate_tokens):
+            continue
+        geometry, shoreline_ring = _geojson_map_geometry(
+            candidate.get("geojson"), location
+        )
+        if not geometry or len(shoreline_ring) < 4:
+            continue
+        latitude, longitude = _ring_centroid(shoreline_ring)
+        distance = _distance_miles(
+            location["latitude"], location["longitude"], latitude, longitude
+        )
+        if distance > 25:
+            continue
+        matches.append((distance, geometry, shoreline_ring))
+    if not matches:
+        return {
+            "geometry": None,
+            "shoreline_ring": [],
+            "source": source,
+            "palis_id": None,
+            "message": (
+                "No verified shoreline outline was found in the state map layer "
+                "or OpenStreetMap. Pins are omitted rather than placed at guessed "
+                "coordinates."
+            ),
+        }
+    _, geometry, shoreline_ring = min(matches, key=lambda match: match[0])
+    return {
+        "geometry": geometry,
+        "shoreline_ring": shoreline_ring,
+        "source": source,
+        "palis_id": None,
+        "message": (
+            "Waterbody outline from OpenStreetMap; shore pins are approximate "
+            "boundary checkpoints, not verified public access."
+        ),
     }
 
 
@@ -1234,24 +1539,15 @@ def _waterbody_geometry(
     elif state == "NH":
         endpoint, name_field, source = NH_WATER_FEATURES_URL, "gnis_name", "NH GRANIT"
     else:
-        return {
-            "geometry": None,
-            "shoreline_ring": [],
-            "source": None,
-            "message": "A waterbody outline is not available from the state map layers.",
-        }
+        name = water_body or str(location.get("place", ""))
+        return _osm_waterbody_geometry(location, state, name)
 
     name = water_body or str(location.get("place", ""))
     tokens = _map_waterbody_tokens(name) or _waterbody_tokens(
         str(location.get("place", ""))
     )
     if not tokens:
-        return {
-            "geometry": None,
-            "shoreline_ring": [],
-            "source": source,
-            "message": "A waterbody outline could not be matched by name.",
-        }
+        return _osm_waterbody_geometry(location, state, name)
     search_token = sorted(tokens, key=lambda token: (-len(token), token))[0]
     out_fields = f"{name_field},PALIS_ID" if state == "MA" else name_field
     query = endpoint + "?" + urlencode(
@@ -1269,20 +1565,16 @@ def _waterbody_geometry(
     try:
         result = _external_json(query, source)
     except DataSourceError as error:
-        return {
-            "geometry": None,
-            "shoreline_ring": [],
-            "source": source,
-            "message": f"The {source} waterbody outline is unavailable ({error}).",
-        }
+        fallback = _osm_waterbody_geometry(location, state, name)
+        if fallback["geometry"] is None:
+            fallback["message"] = (
+                f"The {source} waterbody outline is unavailable ({error}). "
+                + fallback["message"]
+            )
+        return fallback
     features = result.get("features")
     if not isinstance(features, list):
-        return {
-            "geometry": None,
-            "shoreline_ring": [],
-            "source": source,
-            "message": f"{source} returned an unexpected waterbody outline.",
-        }
+        return _osm_waterbody_geometry(location, state, name)
 
     candidates = []
     for feature in features:
@@ -1320,13 +1612,7 @@ def _waterbody_geometry(
             palis_id = None
         candidates.append((distance, map_geometry, shoreline_ring, palis_id))
     if not candidates:
-        return {
-            "geometry": None,
-            "shoreline_ring": [],
-            "source": source,
-            "palis_id": None,
-            "message": f"No {source} outline is published for this waterbody.",
-        }
+        return _osm_waterbody_geometry(location, state, name)
     _, geometry, shoreline_ring, palis_id = min(
         candidates, key=lambda candidate: candidate[0]
     )
@@ -1344,6 +1630,7 @@ def _bathymetry_contours(
     state: str,
     water_body: str | None = None,
     palis_id: int | None = None,
+    shoreline_ring: list[list[float]] | None = None,
 ) -> dict:
     if state == "MA":
         endpoint, name_field, depth_field = MA_BATHYMETRY_URL, "NAME", "DEPTH"
@@ -1513,6 +1800,14 @@ def _bathymetry_contours(
             coordinates = _map_path(path, 100)
             if len(coordinates) < 2:
                 continue
+            if (
+                shoreline_ring
+                and not any(
+                    _point_in_ring(longitude, latitude, shoreline_ring)
+                    for longitude, latitude in coordinates
+                )
+            ):
+                continue
             if total_points + len(coordinates) > 1800:
                 break
             contours.append(
@@ -1592,6 +1887,10 @@ def _shoreline_spots(
     if len(shoreline_ring) < 4:
         return []
     latitude, longitude = _ring_centroid(shoreline_ring)
+    sample_points, shoreline_perimeter = _shoreline_sample_points(shoreline_ring)
+    if not sample_points:
+        return []
+    minimum_spacing = max(0.005, min(0.05, shoreline_perimeter / 9))
     current = wind.get("current", {})
     wind_available = bool(current.get("available"))
     direction = current.get("wind_direction_degrees") if wind_available else None
@@ -1685,7 +1984,7 @@ def _shoreline_spots(
         }
 
     candidates = []
-    for point in shoreline_ring:
+    for point in sample_points:
         bearing = _bearing_degrees(latitude, longitude, point[1], point[0])
         context = contour_context(point)
         candidates.append({"bearing": bearing, "point": point, "depth_context": context})
@@ -1708,11 +2007,55 @@ def _shoreline_spots(
             )
         if context.get("nearest_depth_ft") is not None:
             return (
-                f" The nearest mapped contour is about "
-                f"{context['nearest_distance_miles']:.2f} mi away; it is not a "
-                "measured depth at this pin."
+                f" The nearest mapped {context['nearest_depth_ft']:g}-ft contour "
+                f"is about {context['nearest_distance_miles']:.2f} mi away; it "
+                "does not establish the depth at this pin."
             )
         return " No nearby mapped contour supports a depth-specific claim here."
+
+    def point_rationale(point: list[float], context: dict) -> str:
+        bearing = _bearing_degrees(latitude, longitude, point[1], point[0])
+        shore_side = _compass_direction(bearing)
+        reason = (
+            f"Selected on the {shore_side} shoreline as one of three spaced "
+            "checks around the mapped waterbody perimeter."
+        )
+        if direction is not None and speed is not None and speed >= 3:
+            downwind = (float(direction) + 180) % 360
+            downwind_error = min(
+                (bearing - downwind) % 360, (downwind - bearing) % 360
+            )
+            if downwind_error <= 67.5:
+                reason += (
+                    f" Current {current.get('wind_direction')} wind at "
+                    f"{float(speed):g} mph blows toward "
+                    f"{_compass_direction(downwind)}; this downwind-facing "
+                    "shore is worth checking for wind-pushed surface forage."
+                )
+            else:
+                reason += (
+                    f" Current wind is from {current.get('wind_direction')} at "
+                    f"{float(speed):g} mph; this is not the downwind side, so "
+                    "the pin is included for shoreline coverage."
+                )
+        elif wind_available and speed is not None and speed < 3:
+            reason += (
+                f" Current wind is calm ({float(speed):g} mph), so wind did not "
+                "drive this location choice."
+            )
+        else:
+            reason += (
+                " No validated current wind direction was available, so this "
+                "location is based on mapped shoreline coverage, not a wind claim."
+            )
+        reason += depth_guidance(context)
+        if context["seasonal_adjustment"]:
+            reason += (
+                f" This mapped {context['feature'].replace('_', ' ')} receives "
+                "only a small, low-confidence seasonal ranking adjustment; it "
+                "is not a measured fish location."
+            )
+        return reason
 
     selected = []
     for access in access_spots or []:
@@ -1741,6 +2084,7 @@ def _shoreline_spots(
             for existing in selected
         ):
             continue
+        context = contour_context([point_longitude, point_latitude])
         selected.append(
             {
                 "latitude": point_latitude,
@@ -1751,13 +2095,12 @@ def _shoreline_spots(
                     f"{access.get('source', 'the access dataset')} and lies "
                     "beside this waterbody. Confirm current hours, restrictions, "
                     "and conditions before fishing."
+                    + depth_guidance(context)
                 ),
                 "access_type": access_type,
                 "access_status": access.get("access_status"),
                 "source": access.get("source"),
-                "depth_context": contour_context(
-                    [point_longitude, point_latitude]
-                ),
+                "depth_context": context,
             }
         )
 
@@ -1797,29 +2140,19 @@ def _shoreline_spots(
                         existing["latitude"],
                         existing["longitude"],
                     )
-                    >= 0.05
+                    >= minimum_spacing
                     for existing in selected
                 )
             ),
             None,
         )
         if point is None:
+            if selected:
+                break
             continue
         candidate = next(item for item in ordered if item["point"] is point)
         context = candidate["depth_context"]
-        if direction is not None and speed is not None and speed >= 3:
-            reason = (
-                f"Wind from {current.get('wind_direction')} points toward the "
-                f"{_compass_direction((float(direction) + 180) % 360)} side. "
-                "Fan-cast parallel to shore and around nearby points or inlets; "
-                "this is a search area, not a proven hotspot."
-            )
-        else:
-            reason = (
-                "No usable current wind direction; this is a general shoreline "
-                "checkpoint, not a confirmed hotspot."
-            )
-        reason += depth_guidance(context)
+        reason = point_rationale(point, context)
         if access_message:
             reason += f" {access_message}"
         elif not any(
@@ -1848,6 +2181,8 @@ def _shoreline_spots(
                 "depth_rank_adjustment": context["seasonal_adjustment"],
             }
         )
+        if len(selected) >= 3:
+            break
     return selected[:3]
 
 
@@ -1908,7 +2243,11 @@ def _waterbody_map_data(
 ) -> dict:
     outline = _waterbody_geometry(location, state, water_body)
     bathymetry = _bathymetry_contours(
-        location, state, water_body, outline.get("palis_id")
+        location,
+        state,
+        water_body,
+        outline.get("palis_id"),
+        outline.get("shoreline_ring"),
     )
     profile = profile_for_species(target_species)
     behavior_note = profile["behavior_note"]
@@ -1991,6 +2330,236 @@ def _waterbody_map_data(
             ),
         },
     }
+
+
+def _pdf_safe_text(value: object, max_length: int = 180) -> str:
+    text = str(value).encode("ascii", "replace").decode("ascii")[:max_length]
+    return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def _depth_chart_pdf(payload: DepthChartPdfRequest) -> bytes:
+    map_data = payload.map_data
+    bathymetry = map_data.get("bathymetry")
+    if not isinstance(bathymetry, dict) or not bathymetry.get("available"):
+        raise HTTPException(
+            status_code=422,
+            detail="A PDF chart requires published depth contours for this waterbody.",
+        )
+    contours = bathymetry.get("contours")
+    if not isinstance(contours, list) or not contours or len(contours) > 2000:
+        raise HTTPException(
+            status_code=422,
+            detail="The published contour data is empty or too large to export.",
+        )
+
+    def valid_point(value: object) -> tuple[float, float] | None:
+        if not isinstance(value, (list, tuple)) or len(value) < 2:
+            return None
+        try:
+            longitude, latitude = float(value[0]), float(value[1])
+        except (TypeError, ValueError):
+            return None
+        if (
+            not math.isfinite(longitude)
+            or not math.isfinite(latitude)
+            or not -180 <= longitude <= 180
+            or not -90 <= latitude <= 90
+        ):
+            return None
+        return longitude, latitude
+
+    line_data = []
+    point_count = 0
+    for contour in contours:
+        if not isinstance(contour, dict):
+            continue
+        try:
+            depth = float(contour["depth"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        coordinates = contour.get("coordinates")
+        if not math.isfinite(depth) or not isinstance(coordinates, list):
+            continue
+        points = [
+            point
+            for point in (valid_point(coordinate) for coordinate in coordinates)
+            if point is not None
+        ]
+        if len(points) < 2:
+            continue
+        point_count += len(points)
+        if point_count > 50000:
+            raise HTTPException(
+                status_code=422,
+                detail="The contour data is too large to export in one PDF.",
+            )
+        line_data.append((depth, points))
+    if not line_data:
+        raise HTTPException(
+            status_code=422,
+            detail="No valid contour lines were available for the PDF chart.",
+        )
+
+    geometry = map_data.get("geometry")
+    polygon_rings = []
+    if isinstance(geometry, dict):
+        geometry_type = geometry.get("type")
+        coordinates = geometry.get("coordinates")
+        if geometry_type == "Polygon" and isinstance(coordinates, list):
+            polygons = [coordinates]
+        elif geometry_type == "MultiPolygon" and isinstance(coordinates, list):
+            polygons = coordinates
+        else:
+            polygons = []
+        for polygon in polygons:
+            if not isinstance(polygon, list):
+                continue
+            for ring in polygon:
+                if isinstance(ring, list):
+                    points = [
+                        point
+                        for point in (valid_point(coordinate) for coordinate in ring)
+                        if point is not None
+                    ]
+                    if len(points) >= 4:
+                        polygon_rings.append(points)
+
+    spots = []
+    raw_spots = map_data.get("shoreline_spots", [])
+    if isinstance(raw_spots, list):
+        for index, spot in enumerate(raw_spots[:3], start=1):
+            if not isinstance(spot, dict):
+                continue
+            point = valid_point([spot.get("longitude"), spot.get("latitude")])
+            if point is not None:
+                spots.append((index, point))
+
+    all_points = [
+        point
+        for _, points in line_data
+        for point in points
+    ]
+    all_points.extend(point for ring in polygon_rings for point in ring)
+    all_points.extend(point for _, point in spots)
+    min_longitude = min(point[0] for point in all_points)
+    max_longitude = max(point[0] for point in all_points)
+    min_latitude = min(point[1] for point in all_points)
+    max_latitude = max(point[1] for point in all_points)
+    longitude_span = max(max_longitude - min_longitude, 0.0001)
+    latitude_span = max(max_latitude - min_latitude, 0.0001)
+    longitude_scale = max(
+        math.cos(math.radians((min_latitude + max_latitude) / 2)), 0.01
+    )
+    longitude_span *= longitude_scale
+    map_left, map_bottom, map_width, map_height = 42.0, 105.0, 708.0, 420.0
+    scale = min(map_width / longitude_span, map_height / latitude_span)
+    drawn_width, drawn_height = longitude_span * scale, latitude_span * scale
+    offset_x = map_left + (map_width - drawn_width) / 2
+    offset_y = map_bottom + (map_height - drawn_height) / 2
+
+    def project(point: tuple[float, float]) -> tuple[float, float]:
+        return (
+            offset_x
+            + (point[0] - min_longitude) * longitude_scale * scale,
+            offset_y + (point[1] - min_latitude) * scale,
+        )
+
+    content = io.StringIO()
+    content.write("0.04 0.15 0.22 rg 0 548 792 64 re f\n")
+    content.write("1 1 1 rg BT /F1 18 Tf 42 580 Td ")
+    content.write(f"({_pdf_safe_text(payload.water_body)}) Tj ET\n")
+    content.write("0.08 0.18 0.24 rg BT /F1 9 Tf 42 562 Td ")
+    content.write(
+        f"(Depth contours from { _pdf_safe_text(bathymetry.get('source', 'published GIS data'), 90) } "
+        f"| {len(line_data)} contour lines | units: {_pdf_safe_text(bathymetry.get('unit', 'unknown'), 12)}) Tj ET\n"
+    )
+    for ring in polygon_rings:
+        x, y = project(ring[0])
+        content.write(f"0.22 0.56 0.53 RG 0.82 0.91 0.89 rg 1.2 w {x:.2f} {y:.2f} m\n")
+        for point in ring[1:]:
+            x, y = project(point)
+            content.write(f"{x:.2f} {y:.2f} l\n")
+        content.write("h B\n")
+    content.write("0.86 0.62 0.16 RG 1.0 w\n")
+    for depth, points in line_data:
+        x, y = project(points[0])
+        content.write(f"{x:.2f} {y:.2f} m\n")
+        for point in points[1:]:
+            x, y = project(point)
+            content.write(f"{x:.2f} {y:.2f} l\n")
+        content.write("S\n")
+        x, y = project(points[len(points) // 2])
+        depth_label = _pdf_safe_text(
+            f"{depth:g} {bathymetry.get('unit', 'unknown')}", 20
+        )
+        content.write(f"1 1 1 rg {x - 3:.2f} {y - 3:.2f} 42 11 re f\n")
+        content.write(
+            f"0.04 0.15 0.22 rg BT /F1 7 Tf {x:.2f} {y:.2f} Td "
+            f"({depth_label}) Tj ET\n"
+        )
+    for index, point in spots:
+        x, y = project(point)
+        radius = 6.5
+        content.write(
+            f"0.73 0.18 0.13 rg {x - radius:.2f} {y - radius:.2f} "
+            f"{radius * 2:.2f} {radius * 2:.2f} re f\n"
+        )
+        content.write(
+            f"1 1 1 rg BT /F1 8 Tf {x - 2.2:.2f} {y - 2.8:.2f} Td "
+            f"({index}) Tj ET\n"
+        )
+    content.write("0.04 0.15 0.22 rg BT /F1 10 Tf 42 82 Td ")
+    content.write("(Depth contours) Tj ET\n")
+    content.write("0.86 0.62 0.16 RG 1.2 w 130 86 m 151 86 l S\n")
+    content.write("0.04 0.15 0.22 rg BT /F1 10 Tf 160 82 Td ")
+    content.write("(Suggested shore checks) Tj ET\n")
+    content.write("0.73 0.18 0.13 rg 323 81 10 10 re f\n")
+    content.write("0.28 0.32 0.34 rg BT /F1 8 Tf 42 58 Td ")
+    content.write(
+        f"(Generated from { _pdf_safe_text(bathymetry.get('source_url', ''), 140) }) Tj ET\n"
+    )
+    content.write("0.28 0.32 0.34 rg BT /F1 8 Tf 42 42 Td ")
+    content.write(
+        "(Contours are interpolated depth lines, not depths at shore pins. Verify current access and chart accuracy before fishing.) Tj ET\n"
+    )
+    attribution = bathymetry.get("attribution")
+    if isinstance(attribution, str) and attribution:
+        content.write("0.28 0.32 0.34 rg BT /F1 7 Tf 42 28 Td ")
+        content.write(f"({_pdf_safe_text(attribution, 180)}) Tj ET\n")
+
+    stream = content.getvalue().encode("ascii", "replace")
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 792 612] "
+            b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>"
+        ),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length " + str(len(stream)).encode("ascii") + b" >>\nstream\n"
+        + stream
+        + b"endstream",
+    ]
+    output = io.BytesIO()
+    output.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    for index, object_data in enumerate(objects, start=1):
+        offsets.append(output.tell())
+        output.write(f"{index} 0 obj\n".encode("ascii"))
+        output.write(object_data)
+        output.write(b"\nendobj\n")
+    xref_offset = output.tell()
+    output.write(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
+    output.write(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        output.write(f"{offset:010d} 00000 n \n".encode("ascii"))
+    output.write(
+        (
+            f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+            f"startxref\n{xref_offset}\n%%EOF\n"
+        ).encode("ascii")
+    )
+    return output.getvalue()
 
 
 def _arcgis_nearby_features(
@@ -3189,6 +3758,21 @@ def build_recommendation_report(payload: RecommendationRequest) -> dict:
 @app.post("/api/recommendations")
 def recommendations(payload: RecommendationRequest) -> dict:
     return build_recommendation_report(payload)
+
+
+@app.post("/api/recommendations/depth-chart.pdf")
+def download_depth_chart(payload: DepthChartPdfRequest) -> Response:
+    pdf = _depth_chart_pdf(payload)
+    safe_name = re.sub(
+        r"[^a-z0-9]+", "-", payload.water_body.casefold()
+    ).strip("-") or "waterbody"
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="depth-chart-{safe_name}.pdf"'
+        },
+    )
 
 
 def _read_json(url: str, headers: dict[str, str], body: bytes) -> dict:
