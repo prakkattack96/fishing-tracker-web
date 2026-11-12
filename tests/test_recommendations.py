@@ -1,3 +1,4 @@
+import math
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch
@@ -18,6 +19,56 @@ class RecommendationTests(unittest.TestCase):
             response = server.recommendations(payload)
 
         self.assertEqual(response, response_body)
+
+    def test_wind_refresh_uses_report_location_and_returns_updated_guidance(self):
+        payload = server.WindRefreshRequest(
+            latitude=40.35,
+            longitude=-74.66,
+            timezone="America/New_York",
+            water_type="lake",
+        )
+        current_wind = {
+            "available": True,
+            "wind_speed_mph": 8,
+            "wind_direction_degrees": 225,
+            "wind_direction": "SW",
+            "source": "National Weather Service",
+        }
+        with (
+            patch.object(
+                server,
+                "_external_json",
+                return_value={
+                    "properties": {
+                        "observationStations": "https://api.weather.gov/stations"
+                    }
+                },
+            ),
+            patch.object(
+                server, "_wind_from_observation_stations", return_value=current_wind
+            ) as get_wind,
+        ):
+            result = server.refresh_recommendation_wind(payload)
+
+        self.assertEqual(result["current"], current_wind)
+        self.assertIn("downwind shoreline", result["shoreline_guidance"]["message"])
+        self.assertEqual(get_wind.call_args.args[1], {
+            "latitude": 40.35,
+            "longitude": -74.66,
+        })
+        self.assertTrue(result["updated_at"])
+
+    def test_wind_refresh_rejects_an_invalid_timezone(self):
+        with self.assertRaises(HTTPException) as error:
+            server.refresh_recommendation_wind(
+                server.WindRefreshRequest(
+                    latitude=40.35,
+                    longitude=-74.66,
+                    timezone="Not/A_Timezone",
+                )
+            )
+
+        self.assertEqual(error.exception.status_code, 422)
 
     def test_report_has_day_and_night_picks(self):
         now = datetime.now(ZoneInfo("America/New_York"))
@@ -561,6 +612,69 @@ class RecommendationTests(unittest.TestCase):
         self.assertFalse(wind["available"])
         self.assertIn("stale", wind["message"])
 
+    def test_distant_station_wind_is_not_used_for_local_conditions(self):
+        stations = {
+            "features": [
+                {
+                    "properties": {"stationIdentifier": "KAAA", "name": "Distant station"},
+                    "geometry": {"coordinates": [-73.5, 40.35]},
+                }
+            ]
+        }
+        with patch.object(server, "_external_json", return_value=stations) as request:
+            wind = server._current_station_wind(
+                "https://api.weather.gov/stations",
+                {"latitude": 40.35, "longitude": -74.66},
+                datetime.now(ZoneInfo("America/New_York")),
+            )
+
+        self.assertFalse(wind["available"])
+        self.assertIn("recent usable wind observation", wind["message"])
+        request.assert_called_once()
+
+    def test_station_wind_skips_stale_nearest_station_for_next_fresh_station(self):
+        local_now = datetime.now(ZoneInfo("America/New_York"))
+        stations = {
+            "features": [
+                {
+                    "properties": {"stationIdentifier": "KAAA", "name": "Nearest stale"},
+                    "geometry": {"coordinates": [-74.66, 40.35]},
+                },
+                {
+                    "properties": {"stationIdentifier": "KBBB", "name": "Next fresh"},
+                    "geometry": {"coordinates": [-74.7, 40.36]},
+                },
+            ]
+        }
+
+        def observation(timestamp, direction):
+            return {
+                "properties": {
+                    "timestamp": timestamp.isoformat(),
+                    "windSpeed": {"unitCode": "wmoUnit:km_h-1", "value": 16},
+                    "windDirection": {"value": direction},
+                }
+            }
+
+        with patch.object(
+            server,
+            "_external_json",
+            side_effect=[
+                stations,
+                observation(datetime.now(timezone.utc) - timedelta(hours=2), 270),
+                observation(datetime.now(timezone.utc), 315),
+            ],
+        ):
+            wind = server._current_station_wind(
+                "https://api.weather.gov/stations",
+                {"latitude": 40.35, "longitude": -74.66},
+                local_now,
+            )
+
+        self.assertTrue(wind["available"])
+        self.assertEqual(wind["station_id"], "KBBB")
+        self.assertEqual(wind["wind_direction"], "NW")
+
     def test_waterbody_outline_places_downwind_shoreline_pins(self):
         ring = [
             [-71.01, 42.01],
@@ -587,6 +701,21 @@ class RecommendationTests(unittest.TestCase):
         self.assertGreater(spots[0]["longitude"], -71.0)
         self.assertLess(spots[0]["latitude"], 42.0)
         self.assertIn("NW", spots[0]["reason"])
+
+    def test_waterbody_geometry_preserves_fine_shoreline_points(self):
+        ring = [
+            [
+                -71 + 0.01 * math.cos(index * 2 * math.pi / 240),
+                42 + 0.01 * math.sin(index * 2 * math.pi / 240),
+            ]
+            for index in range(240)
+        ]
+        ring.append(ring[0])
+
+        geometry, shoreline = server._arcgis_map_geometry({"rings": [ring]})
+
+        self.assertEqual(len(geometry["coordinates"][0]), len(ring))
+        self.assertEqual(len(shoreline), len(ring))
 
     def test_calm_or_missing_wind_pin_reason_explains_the_shoreline_choice(self):
         ring = [

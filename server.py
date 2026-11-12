@@ -175,6 +175,13 @@ class RecommendationRequest(BaseModel):
     target_species: str = Field(default="", max_length=40)
 
 
+class WindRefreshRequest(BaseModel):
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    timezone: str = Field(min_length=1, max_length=64)
+    water_type: str = Field(default="waterbody", max_length=20)
+
+
 class DepthChartPdfRequest(BaseModel):
     water_body: str = Field(min_length=2, max_length=100)
     state: str = Field(min_length=2, max_length=2)
@@ -244,7 +251,7 @@ def _nominatim_locations(query: str, include_polygon: bool = False) -> list:
             "countrycodes": "us",
         }
         if include_polygon:
-            search_params.update({"polygon_geojson": 1, "polygon_threshold": 0.002})
+            search_params.update({"polygon_geojson": 1, "polygon_threshold": 0.0001})
         request = Request(
             "https://nominatim.openstreetmap.org/search?"
             + urlencode(search_params),
@@ -971,21 +978,29 @@ def _local_time_and_wind(location: dict) -> tuple[str, datetime, dict]:
                 else None
             ),
         }
-    current_wind = _current_station_wind(
-        observation_stations_url, location, local_now
+    current_wind = _wind_from_observation_stations(
+        observation_stations_url, location, local_now, timezone_name
     )
+    wind["current"] = current_wind
+    wind["current_period"] = current_period
+    return timezone_name, local_now, wind
+
+
+def _wind_from_observation_stations(
+    stations_url: object,
+    location: dict,
+    local_now: datetime,
+    timezone_name: str,
+) -> dict:
+    current_wind = _current_station_wind(stations_url, location, local_now)
     if (
         not current_wind.get("available")
         or current_wind.get("wind_direction_degrees") is None
     ):
-        model_wind = _open_meteo_current_wind(
-            location, local_now, timezone_name
-        )
+        model_wind = _open_meteo_current_wind(location, local_now, timezone_name)
         if model_wind.get("available"):
-            current_wind = model_wind
-    wind["current"] = current_wind
-    wind["current_period"] = current_period
-    return timezone_name, local_now, wind
+            return model_wind
+    return current_wind
 
 
 def _current_station_wind(
@@ -1037,78 +1052,83 @@ def _current_station_wind(
     if not stations:
         return {**unavailable, "message": "NWS did not list a nearby observation station."}
 
-    _, station_id, station_name = min(stations, key=lambda station: station[0])
-    try:
-        observation = _external_json(
-            f"https://api.weather.gov/stations/{station_id}/observations/latest",
-            "National Weather Service",
-        )
-    except DataSourceError as error:
-        return {**unavailable, "message": f"Current NWS station wind is unavailable ({error})."}
-    properties = observation.get("properties")
-    if not isinstance(properties, dict):
-        return {**unavailable, "message": "NWS returned an unexpected station observation."}
+    last_message = "No nearby station reported a recent usable wind observation."
+    for distance, station_id, station_name in sorted(stations)[:5]:
+        if distance > 25:
+            break
+        try:
+            observation = _external_json(
+                f"https://api.weather.gov/stations/{station_id}/observations/latest",
+                "National Weather Service",
+            )
+        except DataSourceError as error:
+            last_message = f"Current NWS station wind is unavailable ({error})."
+            continue
+        properties = observation.get("properties")
+        if not isinstance(properties, dict):
+            last_message = "NWS returned an unexpected station observation."
+            continue
 
-    wind_speed = properties.get("windSpeed")
-    wind_direction = properties.get("windDirection")
-    if not isinstance(wind_speed, dict):
-        return {**unavailable, "message": "NWS did not provide a usable wind-speed observation."}
-    if not isinstance(wind_direction, dict):
-        wind_direction = {}
-    try:
-        speed_value = float(wind_speed["value"])
-        speed_unit = str(wind_speed["unitCode"]).rsplit(":", 1)[-1]
-        if speed_unit == "km_h-1":
-            speed_mph = speed_value * 0.621371
-        elif speed_unit == "m_s-1":
-            speed_mph = speed_value * 2.23694
-        elif speed_unit in {"mi_h-1", "mph"}:
-            speed_mph = speed_value
-        else:
-            raise ValueError(f"Unsupported NWS wind-speed unit: {speed_unit}")
-        if not math.isfinite(speed_mph) or speed_mph < 0:
-            raise ValueError("NWS returned an invalid wind speed.")
-        direction_value = wind_direction.get("value")
-        direction_degrees = (
-            float(direction_value) % 360 if direction_value is not None else None
-        )
-        observed_at = datetime.fromisoformat(
-            str(properties["timestamp"]).replace("Z", "+00:00")
-        )
-    except (KeyError, TypeError, ValueError, AttributeError):
-        return {**unavailable, "message": "NWS did not provide a usable wind observation."}
-    if observed_at.tzinfo is None:
-        observed_at = observed_at.replace(tzinfo=timezone.utc)
-    age_minutes = (
-        local_now.astimezone(timezone.utc) - observed_at.astimezone(timezone.utc)
-    ).total_seconds() / 60
-    if age_minutes < -15 or age_minutes > 180:
+        wind_speed = properties.get("windSpeed")
+        wind_direction = properties.get("windDirection")
+        if not isinstance(wind_speed, dict):
+            last_message = "NWS did not provide a usable wind-speed observation."
+            continue
+        if not isinstance(wind_direction, dict):
+            wind_direction = {}
+        try:
+            speed_value = float(wind_speed["value"])
+            speed_unit = str(wind_speed["unitCode"]).rsplit(":", 1)[-1]
+            if speed_unit == "km_h-1":
+                speed_mph = speed_value * 0.621371
+            elif speed_unit == "m_s-1":
+                speed_mph = speed_value * 2.23694
+            elif speed_unit in {"mi_h-1", "mph"}:
+                speed_mph = speed_value
+            else:
+                raise ValueError(f"Unsupported NWS wind-speed unit: {speed_unit}")
+            if not math.isfinite(speed_mph) or speed_mph < 0:
+                raise ValueError("NWS returned an invalid wind speed.")
+            direction_value = wind_direction.get("value")
+            direction_degrees = (
+                float(direction_value) % 360 if direction_value is not None else None
+            )
+            if direction_degrees is not None and not math.isfinite(direction_degrees):
+                raise ValueError("NWS returned an invalid wind direction.")
+            observed_at = datetime.fromisoformat(
+                str(properties["timestamp"]).replace("Z", "+00:00")
+            )
+        except (KeyError, TypeError, ValueError, AttributeError):
+            last_message = "NWS did not provide a usable wind observation."
+            continue
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=timezone.utc)
+        age_minutes = (
+            local_now.astimezone(timezone.utc) - observed_at.astimezone(timezone.utc)
+        ).total_seconds() / 60
+        if age_minutes < -15 or age_minutes > 90:
+            last_message = "The nearest NWS wind observation is stale."
+            continue
+
+        compass = None
+        if direction_degrees is not None:
+            compass = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")[
+                round(direction_degrees / 45) % 8
+            ]
         return {
-            **unavailable,
-            "message": "The nearest NWS wind observation is stale.",
+            "available": True,
+            "wind_speed_mph": round(speed_mph, 1),
+            "wind_direction_degrees": direction_degrees,
+            "wind_direction": compass,
             "station": station_name,
             "station_id": station_id,
+            "distance_miles": round(distance, 1),
+            "station_url": f"https://api.weather.gov/stations/{station_id}",
             "observed_at": observed_at.isoformat(),
             "age_minutes": round(max(age_minutes, 0)),
+            "source": "National Weather Service",
         }
-
-    compass = None
-    if direction_degrees is not None:
-        compass = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")[
-            round(direction_degrees / 45) % 8
-        ]
-    return {
-        "available": True,
-        "wind_speed_mph": round(speed_mph, 1),
-        "wind_direction_degrees": direction_degrees,
-        "wind_direction": compass,
-        "station": station_name,
-        "station_id": station_id,
-        "station_url": f"https://api.weather.gov/stations/{station_id}",
-        "observed_at": observed_at.isoformat(),
-        "age_minutes": round(max(age_minutes, 0)),
-        "source": "National Weather Service",
-    }
+    return {**unavailable, "message": last_message}
 
 
 def _open_meteo_current_wind(
@@ -1140,6 +1160,8 @@ def _open_meteo_current_wind(
     try:
         speed = float(current["wind_speed_10m"])
         direction = float(current["wind_direction_10m"]) % 360
+        if not math.isfinite(direction):
+            raise ValueError("Open-Meteo returned an invalid wind direction.")
         observed_at = datetime.fromisoformat(str(current["time"]))
         if observed_at.tzinfo is None:
             observed_at = observed_at.replace(tzinfo=ZoneInfo(timezone_name))
@@ -1151,7 +1173,7 @@ def _open_meteo_current_wind(
     age_minutes = (
         local_now.astimezone(timezone.utc) - observed_at.astimezone(timezone.utc)
     ).total_seconds() / 60
-    if not math.isfinite(speed) or speed < 0 or age_minutes < -30 or age_minutes > 180:
+    if not math.isfinite(speed) or speed < 0 or age_minutes < -30 or age_minutes > 90:
         return {
             **unavailable,
             "message": "Open-Meteo's current wind estimate is stale or invalid.",
@@ -1281,7 +1303,7 @@ def _arcgis_map_geometry(geometry: object) -> tuple[dict | None, list[list[float
     if isinstance(rings, list):
         normalized_rings = [
             ring
-            for ring in (_map_path(item, 180) for item in rings)
+            for ring in (_map_path(item, 5000) for item in rings)
             if len(ring) >= 4
         ]
         if not normalized_rings:
@@ -1292,7 +1314,7 @@ def _arcgis_map_geometry(geometry: object) -> tuple[dict | None, list[list[float
     if isinstance(paths, list):
         normalized_paths = [
             path
-            for path in (_map_path(item, 180) for item in paths)
+            for path in (_map_path(item, 5000) for item in paths)
             if len(path) >= 2
         ]
         if not normalized_paths:
@@ -1428,7 +1450,7 @@ def _geojson_map_geometry(
             continue
         rings = [
             ring
-            for ring in (_map_path(item, 180) for item in polygon)
+            for ring in (_map_path(item, 5000) for item in polygon)
             if len(ring) >= 4
         ]
         if rings:
@@ -3758,6 +3780,42 @@ def build_recommendation_report(payload: RecommendationRequest) -> dict:
 @app.post("/api/recommendations")
 def recommendations(payload: RecommendationRequest) -> dict:
     return build_recommendation_report(payload)
+
+
+@app.post("/api/recommendations/wind")
+def refresh_recommendation_wind(payload: WindRefreshRequest) -> dict:
+    try:
+        zone = ZoneInfo(payload.timezone)
+    except ZoneInfoNotFoundError as error:
+        raise HTTPException(status_code=422, detail="A valid waterbody timezone is required.") from error
+    location = {"latitude": payload.latitude, "longitude": payload.longitude}
+    local_now = datetime.now(zone)
+    try:
+        point = _external_json(
+            f"https://api.weather.gov/points/{payload.latitude:.4f},{payload.longitude:.4f}",
+            "National Weather Service",
+        )
+    except DataSourceError:
+        current_wind = _open_meteo_current_wind(
+            location, local_now, payload.timezone
+        )
+    else:
+        properties = point.get("properties")
+        stations_url = (
+            properties.get("observationStations")
+            if isinstance(properties, dict)
+            else None
+        )
+        current_wind = _wind_from_observation_stations(
+            stations_url, location, local_now, payload.timezone
+        )
+    return {
+        "current": current_wind,
+        "shoreline_guidance": _wind_shoreline_guidance(
+            {"current": current_wind}, payload.water_type
+        ),
+        "updated_at": local_now.isoformat(),
+    }
 
 
 @app.post("/api/recommendations/depth-chart.pdf")

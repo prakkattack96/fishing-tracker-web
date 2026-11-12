@@ -44,7 +44,11 @@ const state = {
   photoUrl: null,
   installPrompt: null,
   syncBusy: false,
-  recommendationMap: null
+  recommendationMap: null,
+  recommendationWindRefreshTimer: null,
+  recommendationWindRequest: null,
+  recommendationWindElements: null,
+  recommendationWindBusy: false
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -615,13 +619,14 @@ function googleMapsUrl(point) {
 
 function renderRecommendationMap(report) {
   const mapData = report.waterbody_map || {};
+  let windGuidanceElement = null;
   const section = reportElement("section", "panel recommendation-map-card");
   section.append(
     reportElement("h3", "", "Waterbody map & shore-casting zones"),
     reportElement(
       "p",
       "muted small",
-      "Satellite imagery is not live. Numbered pins are approximate shoreline checks, wind-informed when current direction is available; they are not verified hotspots or public access."
+      "Satellite imagery is not live. Numbered pins are approximate shoreline checks, wind-informed when current direction is available; they are not verified hotspots or public access. Wind refreshes do not move the pins; rebuild the report to recalculate them."
     )
   );
   const map = document.createElement("div");
@@ -631,7 +636,10 @@ function renderRecommendationMap(report) {
   section.append(map);
 
   const guidance = mapData.wind_guidance?.message;
-  if (guidance) section.append(reportElement("p", "wind-guidance muted", guidance));
+  if (guidance) {
+    windGuidanceElement = reportElement("p", "wind-guidance muted", guidance);
+    section.append(windGuidanceElement);
+  }
   if (!mapData.geometry) {
     section.append(reportElement(
       "p",
@@ -788,7 +796,7 @@ function renderRecommendationMap(report) {
       mapData.bathymetry.attribution
     ));
   }
-  return { section, map, mapData };
+  return { section, map, mapData, windGuidanceElement };
 }
 
 function initializeRecommendationMap(mapElement, mapData) {
@@ -878,6 +886,8 @@ function initializeRecommendationMap(mapElement, mapData) {
 
 function renderRecommendationReport(report) {
   const container = $("#recommendation-results");
+  window.clearInterval(state.recommendationWindRefreshTimer);
+  state.recommendationWindRefreshTimer = null;
   state.recommendationMap?.remove();
   state.recommendationMap = null;
   container.replaceChildren();
@@ -935,7 +945,50 @@ function renderRecommendationReport(report) {
 
     const windPanel = reportElement("section", "panel wind-panel");
     windPanel.append(reportElement("h3", "", "Current local wind"));
-    const currentWind = report.wind?.current;
+    const windReading = reportElement("p");
+    const windSourceLink = document.createElement("a");
+    windSourceLink.target = "_blank";
+    windSourceLink.rel = "noopener noreferrer";
+    const windGuidance = reportElement("p", "wind-guidance");
+    const windStatus = reportElement("p", "wind-update-status muted small");
+    const refreshButton = document.createElement("button");
+    refreshButton.type = "button";
+    refreshButton.className = "button button-outline";
+    refreshButton.textContent = "Refresh wind";
+    refreshButton.addEventListener("click", refreshRecommendationWind);
+    windPanel.append(windReading, windSourceLink, windGuidance, refreshButton, windStatus);
+
+    const mapCard = renderRecommendationMap(report);
+    container.append(overview, windPanel, lureGrid, mapCard.section);
+    initializeRecommendationMap(mapCard.map, mapCard.mapData);
+    state.recommendationWindRequest = {
+      latitude: mapCard.mapData.center?.latitude,
+      longitude: mapCard.mapData.center?.longitude,
+      timezone: report.timezone,
+      water_type: report.water_type || "waterbody"
+    };
+    state.recommendationWindElements = {
+      windReading,
+      windSourceLink,
+      windGuidance,
+      windStatus,
+      refreshButton,
+      mapWindGuidance: mapCard.windGuidanceElement
+    };
+    updateRecommendationWindPanel(
+      report.wind?.current,
+      report.wind?.shoreline_guidance,
+      report.generated_at
+    );
+    state.recommendationWindRefreshTimer = window.setInterval(
+      refreshRecommendationWind,
+      5 * 60 * 1000
+    );
+}
+
+function updateRecommendationWindPanel(currentWind, guidance, updatedAt) {
+    const elements = state.recommendationWindElements;
+    if (!elements) return;
     if (currentWind?.available) {
       const age = !Number.isFinite(currentWind.age_minutes) || currentWind.age_minutes <= 1
         ? "just now"
@@ -943,43 +996,77 @@ function renderRecommendationReport(report) {
       const direction = currentWind.wind_direction
         ? `from ${currentWind.wind_direction}`
         : "with variable direction";
+      const stationDistance = Number.isFinite(currentWind.distance_miles)
+        ? ` · ${currentWind.distance_miles} mi away`
+        : "";
       const sourceDescription = currentWind.is_modelled
-        ? "current model estimate from Open-Meteo"
-        : `observed ${age} at ${currentWind.station || "the nearest NWS station"}`;
-      windPanel.append(reportElement(
-        "p",
-        "",
-        `${currentWind.wind_speed_mph} mph ${direction} · ${sourceDescription}`
-      ));
-      if (currentWind.station_url) {
-        const stationLink = document.createElement("a");
-        stationLink.href = currentWind.station_url;
-        stationLink.target = "_blank";
-        stationLink.rel = "noopener noreferrer";
-        stationLink.textContent = currentWind.is_modelled
-          ? "Open-Meteo source details"
-          : "NWS station details";
-        windPanel.append(stationLink);
-      }
+        ? `model estimate from Open-Meteo (${age})`
+        : `observed ${age} at ${currentWind.station || "the nearest NWS station"}${stationDistance}`;
+      elements.windReading.textContent =
+        `${currentWind.wind_speed_mph} mph ${direction} · ${sourceDescription}`;
     } else {
-      windPanel.append(reportElement(
-        "p",
-        "muted",
-        currentWind?.message || "A current NWS station wind reading is unavailable."
-      ));
+      elements.windReading.textContent =
+        currentWind?.message || "A current wind reading is unavailable.";
     }
-    const windGuidance = report.wind?.shoreline_guidance?.message;
-    if (windGuidance) windPanel.append(reportElement("p", "wind-guidance", windGuidance));
 
-    const mapCard = renderRecommendationMap(report);
-    container.append(overview, windPanel, lureGrid, mapCard.section);
-    initializeRecommendationMap(mapCard.map, mapCard.mapData);
+    elements.windSourceLink.hidden = !currentWind?.station_url;
+    if (currentWind?.station_url) {
+      elements.windSourceLink.href = currentWind.station_url;
+      elements.windSourceLink.textContent = currentWind.is_modelled
+        ? "Open-Meteo source details"
+        : "NWS station details";
+    }
+    const guidanceMessage = guidance?.message || "";
+    elements.windGuidance.textContent = guidanceMessage;
+    elements.windGuidance.hidden = !guidanceMessage;
+    if (elements.mapWindGuidance) {
+      elements.mapWindGuidance.textContent = guidanceMessage;
+    }
+    const checkedAt = new Date(updatedAt);
+    elements.windStatus.classList.remove("error");
+    elements.windStatus.textContent = Number.isNaN(checkedAt.getTime())
+      ? "Automatically checks for newer observations every 5 minutes; source observations may update less often."
+      : `Checked ${checkedAt.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}. Automatically checks every 5 minutes; source observations may update less often.`;
+}
+
+async function refreshRecommendationWind() {
+    if (!state.recommendationWindRequest || state.recommendationWindBusy) return;
+    const elements = state.recommendationWindElements;
+    state.recommendationWindBusy = true;
+    elements.refreshButton.disabled = true;
+    elements.refreshButton.textContent = "Refreshing…";
+    try {
+      const result = await fetchJson(
+        `${(CONFIG.apiBaseUrl || "").replace(/\/$/, "")}/api/recommendations/wind`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(state.recommendationWindRequest)
+        }
+      );
+      updateRecommendationWindPanel(
+        result.current,
+        result.shoreline_guidance,
+        result.updated_at
+      );
+    } catch (error) {
+      elements.windStatus.textContent =
+        `Wind refresh failed; showing the previous reading. ${error.message || "Try again."}`;
+      elements.windStatus.classList.add("error");
+    } finally {
+      state.recommendationWindBusy = false;
+      elements.refreshButton.disabled = false;
+      elements.refreshButton.textContent = "Refresh wind";
+    }
 }
 
 async function submitRecommendation(event) {
   event.preventDefault();
   const form = $("#recommendation-form");
   if (!form.reportValidity()) return;
+    window.clearInterval(state.recommendationWindRefreshTimer);
+    state.recommendationWindRefreshTimer = null;
+    state.recommendationWindRequest = null;
   const button = $("#recommendation-submit");
   const message = $("#recommendation-message");
   button.disabled = true;

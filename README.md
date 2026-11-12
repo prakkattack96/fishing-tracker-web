@@ -15,20 +15,24 @@ It uses:
   fishing access.
 - USGS Water Data for a recent nearby water-temperature reading when available.
 - The nearest available National Weather Service station's latest wind
-  observation, including its age and direction. The hourly forecast informs
-  day/night lure ranking using wind, cloud cover, precipitation probability,
-  and air-temperature changes; those forecasts are not displayed as local
-  fishing facts.
+  observation within 25 miles, including its distance, age, and direction.
+  The hourly forecast informs day/night lure ranking using wind, cloud cover,
+  precipitation probability, and air-temperature changes; those forecasts are
+  not displayed as local fishing facts.
 - A satellite map from Esri, state waterbody outlines when available, and an
   OpenStreetMap boundary fallback when a state outline is unavailable. Official
   Massachusetts or New Hampshire bathymetric contours are shown when available.
+  The map keeps finer shoreline geometry for a more faithful waterbody trace.
   Massachusetts contour depths are in feet. The app matches mapped MassGIS
   waterbodies by `PALIS_ID`, excludes shoreline/island lines, and exposes the
   available contour-depth range and interval. The interactive contour overlay
   remains on the existing map.
 - Current NWS station wind when fresh and complete, falling back to a
   timestamp-checked Open-Meteo model estimate when station wind is missing.
-  The map labels modelled wind separately from station observations.
+  The guide checks for newer wind data every five minutes and labels modelled
+  wind separately from station observations; the upstream stations and model
+  may publish new readings less often. Stale station observations older than
+  90 minutes are skipped in favor of a fresher nearby station or model.
 - Seasonal and nearby-water-temperature lure profiles with specific sizes,
   rigging, retrieval, shore habitat, rationale, and a backup presentation.
 - Public shoreline-access pins only when the state or OpenStreetMap record
